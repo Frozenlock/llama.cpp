@@ -350,6 +350,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
+    // MLA (DeepSeek2/GLM-DSA family): latent projections are mirrored, per-head
+    // decompression matrices are split on the head axis
+    static const std::regex pattern_mla_mirrored ("blk\\.\\d*\\.attn_(q_a|kv_a_mqa)\\.weight");
+    static const std::regex pattern_mla_q_b      ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_mla_kv_b     ("blk\\.\\d*\\.attn_(k|v)_b\\.weight");
+
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
@@ -422,6 +428,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // MLA attention: the compressed latent path (q_a, kv_a_mqa, their norms via
+        // fall-through, and the single-head latent KV cache) is mirrored on all devices;
+        // q_b and the k_b/v_b decompression tensors are split by attention head.
+        if (std::regex_match(tensor_name, pattern_mla_mirrored)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+#ifdef TP_SPIKE_MIRROR_ATTN
+        // BISECT: mirror the whole MLA attention, split only the FFN/experts
+        if (std::regex_match(tensor_name, pattern_mla_q_b) ||
+                std::regex_match(tensor_name, pattern_mla_kv_b) ||
+                (hparams.is_mla() && std::regex_match(tensor_name, pattern_attn_out_weight))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+#else
+        if (std::regex_match(tensor_name, pattern_mla_q_b)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_mla_kv_b)) {
+            // 3D tensors {*, *, n_head}: split on the head axis
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+        }
+#endif
+        if (hparams.is_mla() && std::regex_match(tensor_name, pattern_kv_cache)) {
+            // latent KV cache has a single head shared by all query heads: mirror it
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -587,6 +620,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            }
+        } else if (hparams.is_mla()) {
+            // MLA attention: granularity is defined in whole (decompressed) heads.
+            // The GQA-based math below would use n_gqa == n_head (single latent KV head)
+            // and produce a granularity larger than the tensors themselves.
+            const int64_t width_k = hparams.n_embd_head_k_mla();
+            const int64_t width_v = hparams.n_embd_head_v_mla();
+            // heads per split chunk, aligned to the quant block size on the q_b axis
+            const int64_t heads_per_chunk = std::lcm(width_k, blck_size) / width_k;
+            if (std::regex_match(tensor_name, pattern_mla_q_b)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {heads_per_chunk * width_k};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {heads_per_chunk * width_v};
+            }
+            if (std::regex_match(tensor_name, pattern_mla_kv_b)) {
+                // axis-2 split: granularity is a head count, not an element count
+                GGML_ASSERT(segments.size() == 1);
+                return {heads_per_chunk};
             }
         } else {
             // regular attention

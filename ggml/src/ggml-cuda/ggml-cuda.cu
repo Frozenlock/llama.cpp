@@ -3758,6 +3758,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
+    // TP-SPIKE: graph-usage telemetry (env TP_SPIKE_GRAPHSTATS)
+    {
+        static bool stats_on = getenv("TP_SPIKE_GRAPHSTATS") != nullptr;
+        if (stats_on) {
+            static int n_calls = 0, n_replay = 0, n_capture = 0, n_eager = 0;
+            n_calls++;
+            if (!use_cuda_graph) n_eager++;
+            else if (cuda_graph_update_required) n_capture++;
+            else n_replay++;
+            if (n_calls % 500 == 0) {
+                fprintf(stderr, "TPGRAPH dev=%d calls=%d replay=%d capture=%d eager=%d\n",
+                    cuda_ctx->device, n_calls, n_replay, n_capture, n_eager);
+            }
+        }
+    }
+
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
