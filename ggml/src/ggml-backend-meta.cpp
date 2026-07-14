@@ -2228,9 +2228,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
-    static const bool tp_spike_dump = getenv("TP_SPIKE_DUMP") != nullptr;
+    static const bool tp_spike_dump   = getenv("TP_SPIKE_DUMP") != nullptr;
+    static const bool tp_spike_timing = getenv("TP_SPIKE_TIMING") != nullptr;
+    int64_t t_launch_us = 0, t_reduce_us = 0, t_start_us = 0;
+    if (tp_spike_timing) {
+        t_start_us = ggml_time_us();
+    }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const int64_t t0 = tp_spike_timing ? ggml_time_us() : 0;
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -2267,6 +2273,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        const int64_t t1 = tp_spike_timing ? ggml_time_us() : 0;
+
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
@@ -2286,6 +2294,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+        }
+        if (tp_spike_timing) {
+            const int64_t t2 = ggml_time_us();
+            t_launch_us += t1 - t0;
+            t_reduce_us += t2 - t1;
+        }
+    }
+    if (tp_spike_timing) {
+        // synchronize to attribute the GPU-side tail to this compute call
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+        const int64_t t_total = ggml_time_us() - t_start_us;
+        static int64_t acc_total = 0, acc_launch = 0, acc_reduce = 0;
+        static int     n_tok = 0;
+        acc_total += t_total; acc_launch += t_launch_us; acc_reduce += t_reduce_us;
+        n_tok++;
+        if (n_tok % 50 == 0) {
+            fprintf(stderr, "TPTIMING n=%d subgraphs=%zu avg_total=%lldus host_launch=%lldus host_reduce=%lldus gpu_tail=%lldus\n",
+                n_tok, backend_ctx->n_subgraphs,
+                (long long)(acc_total/n_tok), (long long)(acc_launch/n_tok), (long long)(acc_reduce/n_tok),
+                (long long)((acc_total - acc_launch - acc_reduce)/n_tok));
         }
     }
     return GGML_STATUS_SUCCESS;

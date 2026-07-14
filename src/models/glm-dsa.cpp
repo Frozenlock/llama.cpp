@@ -73,9 +73,12 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
 
+    // load the NextN/MTP layer for real when MTP speculative decoding is requested
+    static const bool load_nextn = getenv("LLAMA_GLM_MTP") != nullptr;
+
     for (int i = 0; i < n_layer_all; ++i) {
         int flags = 0;
-        if (i >= n_layer) {
+        if (i >= n_layer && !load_nextn) {
             // skip all tensors in the NextN layers
             // TODO @ngxson : TENSOR_NOT_REQUIRED was a hack, need to remove it later
             flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
@@ -147,6 +150,9 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm_dsa::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
