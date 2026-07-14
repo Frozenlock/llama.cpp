@@ -492,6 +492,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
+
+    // hybrid TP x PP: a tensor living outside this meta device (another pipeline stage's
+    // buffer, or a host/plain-GPU buffer) is a complete replica from this device's
+    // perspective; boundary copies broadcast it to all simple backends.
+    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
+
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 

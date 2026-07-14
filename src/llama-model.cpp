@@ -696,6 +696,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
+        // hybrid TP x PP: -ts controls the layer distribution across the TP groups;
+        // within a group the tensor split is always even
+        if (ud->grouped) {
+            tensor_split = nullptr;
+        }
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
@@ -2350,6 +2355,7 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
+        /*.n_tp_size                    =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

@@ -179,12 +179,34 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
+
+            // hybrid TP x PP: partition the devices into groups of n_tp_size and create
+            // one meta (TP) device per group; the regular layer-split logic then
+            // pipelines across the groups.
+            size_t tp_group_size = devs.size();
+            if (params.n_tp_size > 0) {
+                const size_t g = (size_t) params.n_tp_size;
+                if (g <= devs.size() && devs.size() % g == 0) {
+                    tp_group_size = g;
+                } else {
+                    LLAMA_LOG_WARN("%s: ignoring n_tp_size=%d (must divide %zu)\n",
+                        __func__, params.n_tp_size, devs.size());
+                }
+            }
+
+            model->get_split_state_ud.n_devices = tp_group_size;
+            model->get_split_state_ud.grouped   = tp_group_size < devs.size();
             model->get_split_state_ud.model     = model;
-            gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
+            for (size_t g0 = 0; g0 < devs.size(); g0 += tp_group_size) {
+                if (tp_group_size < devs.size()) {
+                    LLAMA_LOG_INFO("%s: creating TP group %zu with devices [%zu..%zu]\n",
+                        __func__, g0/tp_group_size, g0, g0 + tp_group_size - 1);
+                }
+                gpus.push_back({
+                    true, ggml_backend_meta_device(
+                    devs.data() + g0, tp_group_size, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                });
+            }
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);

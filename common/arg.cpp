@@ -2518,6 +2518,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--tp-size"}, "N",
+        "devices per tensor-parallel group with --split-mode tensor; layers are\n"
+        "pipelined across the groups (default: 0 = all devices in one group)",
+        [](common_params & params, int value) {
+            params.n_tp_size = value;
+        }
+    ).set_env("LLAMA_ARG_TP_SIZE"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"

@@ -535,6 +535,7 @@ struct llama_device {
 
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
+    bool                       grouped; // multiple meta devices (hybrid TP x PP)
     const struct llama_model * model;
 };
 
