@@ -397,10 +397,16 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // LLAMA_PP_PIPELINE=1: opt-in ubatch pipelining for the TPxPP hybrid
+        // (tensor split mode with LLAMA_TP_GROUP_SIZE < n_devices). The causal
+        // KV dependency between consecutive ubatches is satisfied structurally
+        // because pipeline stages are ordered, same as in layer-split mode.
+        const bool pp_pipeline_env = getenv("LLAMA_PP_PIPELINE") && atoi(getenv("LLAMA_PP_PIPELINE")) != 0;
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
-            model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+            (model.split_mode() == LLAMA_SPLIT_MODE_LAYER ||
+             (pp_pipeline_env && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR)) &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
