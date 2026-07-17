@@ -395,8 +395,8 @@ static void ggml_cuda_ar_wait_for_compute(
 
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n_devices) {
 
-    if (n_devices != 2) {
-        GGML_LOG_DEBUG("%s: internal AllReduce only supports n_devices=2 (got %zu); "
+    if (n_devices != 2 && n_devices != 4) {
+        GGML_LOG_DEBUG("%s: internal AllReduce supports n_devices=2 or 4 (got %zu); "
                        "falling back\n", __func__, n_devices);
         return nullptr;
     }
@@ -430,6 +430,53 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
+    }
+
+    // Enable P2P access for every device pair: without this,
+    // cudaMemcpyPeerAsync silently stages through host memory.
+    for (size_t i = 0; i < n_devices; ++i) {
+        ggml_cuda_set_device(devices[i]);
+        for (size_t j = 0; j < n_devices; ++j) {
+            if (i == j) {
+                continue;
+            }
+            int can = 0;
+            if (cudaDeviceCanAccessPeer(&can, devices[i], devices[j]) == cudaSuccess && can) {
+                const cudaError_t err = cudaDeviceEnablePeerAccess(devices[j], 0);
+                if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+                    GGML_LOG_WARN("%s: enable peer access %d->%d failed (%s)\n",
+                                  __func__, devices[i], devices[j], cudaGetErrorString(err));
+                }
+                (void) cudaGetLastError(); // clear sticky already-enabled error
+            }
+        }
+    }
+
+    // Explicitly enable P2P access between exchange-round device pairs —
+    // ONLY when the P2P AR path is requested: force-enabling peer access
+    // changes transport for every cross-GPU copy in the process, and pairs
+    // that cross the root complex regress badly (measured: TP2 456 -> 196).
+    const char * p2p_env = getenv("GGML_CUDA_AR_P2P");
+    const bool   p2p_opt_in = p2p_env != nullptr && atoi(p2p_env) != 0;
+    for (size_t i = 0; p2p_opt_in && i < n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        for (size_t j = 0; j < n_devices; ++j) {
+            if (i == j) {
+                continue;
+            }
+            int can = 0;
+            if (cudaDeviceCanAccessPeer(&can, p->devices[i], p->devices[j]) == cudaSuccess && can) {
+                const cudaError_t err = cudaDeviceEnablePeerAccess(p->devices[j], 0);
+                if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+                    GGML_LOG_WARN("%s: peer access %d->%d failed: %s\n",
+                                  __func__, p->devices[i], p->devices[j], cudaGetErrorString(err));
+                }
+                (void) cudaGetLastError(); // clear sticky already-enabled error
+            } else {
+                GGML_LOG_WARN("%s: no P2P capability %d->%d; AR P2P path will stage via host\n",
+                              __func__, p->devices[i], p->devices[j]);
+            }
+        }
     }
 
     // Per-device streams and event pools.
@@ -590,6 +637,89 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // (e.g. BF16 wire / F32 accumulator) the add kernel rounds dst through T_src
 // for bit-equivalence between GPUs and we skip the otherwise-needed
 // post-conversion entirely.
+// P2P-direct exchange round: each rank pulls its round-peer's contribution
+// straight into local dev_tmp over PCIe P2P (no host bounce), then adds on the
+// compute stream. In-place safety (src == dst): rank i's add waits until its
+// peer has finished READING rank i's buffer (ev.cpy[0] fence), so the
+// overwrite can't race the peer's pull.
+template <typename T_src, typename T_dst>
+static bool ggml_cuda_ar_allreduce_copy_impl_p2p(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
+        T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
+        const bool              compute[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne,
+        size_t                  nbytes,
+        const int               peer_xor) {
+    GGML_ASSERT(peer_xor > 0 && peer_xor < (int) p->n_devices);
+    GGML_ASSERT(nbytes <= p->copy_bytes);
+    GGML_ASSERT(ne <= std::numeric_limits<int>::max());
+
+    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
+
+    ggml_backend_cuda_context * cuda_ctx[GGML_CUDA_MAX_DEVICES] = {};
+
+    // Phase A: publish compute-ready on every rank (event on the compute stream).
+    for (int i = 0; i < (int) p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].app, cuda_ctx[i]->stream()));
+        if (!compute[i]) {
+            // inactive shard contributes zeros; zero our own source so the
+            // peer's pull sees zeros (ordered after app on the same stream is
+            // not required: memset on our AR stream, peer waits our app AND we
+            // fence below via cpy event ordering)
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[i][slot].app));
+            CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, p->streams[i]));
+            CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].app, p->streams[i]));
+        }
+    }
+
+    // Phase B: every rank pulls its peer's buffer P2P into dev_tmp on the AR stream.
+    for (int i = 0; i < (int) p->n_devices; ++i) {
+        const int peer = i ^ peer_xor;
+        ggml_cuda_set_device(p->devices[i]);
+
+        if (p->dev_tmp_kernel_done_valid) {
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i]));
+        }
+        CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].app));
+        CUDA_CHECK(cudaMemcpyPeerAsync(
+            p->dev_tmp[i], p->devices[i],
+            src_buf[peer], p->devices[peer],
+            nbytes, p->streams[i]));
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[0], p->streams[i])); // "read of peer done"
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d,    p->streams[i])); // my copy-in done
+    }
+
+    // Phase C: adds on the compute streams, fenced on (my copy-in) AND (peer's read of me).
+    for (int i = 0; i < (int) p->n_devices; ++i) {
+        const int peer = i ^ peer_xor;
+        ggml_cuda_set_device(p->devices[i]);
+
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[peer][slot].cpy[0]));
+
+        const int block_size = 256;
+        int n_blocks = (int) ((ne + block_size - 1) / block_size);
+        if (n_blocks > 1024) {
+            n_blocks = 1024;
+        }
+        ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, cuda_ctx[i]->stream()>>>(
+            dst_buf[i],
+            reinterpret_cast<const T_src *>(p->dev_tmp[i]),
+            (int) ne);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
+    }
+    p->dev_tmp_kernel_done_valid = true;
+
+    return true;
+}
+
 template <typename T_src, typename T_dst>
 static bool ggml_cuda_ar_allreduce_copy_impl(
         ggml_cuda_ar_pipeline * p,
@@ -598,8 +728,9 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
         const bool              compute[GGML_CUDA_MAX_DEVICES],
         int64_t                 ne,
-        size_t                  nbytes) {
-    GGML_ASSERT(p->n_devices == 2);
+        size_t                  nbytes,
+        const int               peer_xor) {
+    GGML_ASSERT(peer_xor > 0 && peer_xor < (int) p->n_devices);
     GGML_ASSERT(nbytes <= p->copy_bytes);
     GGML_ASSERT(ne <= std::numeric_limits<int>::max());
 
@@ -610,10 +741,10 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
     GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
 
-    ggml_backend_cuda_context * cuda_ctx[2] = {};
+    ggml_backend_cuda_context * cuda_ctx[GGML_CUDA_MAX_DEVICES] = {};
 
-    // Stage 1: both GPUs copy their local contribution to pinned host memory.
-    for (int i = 0; i < 2; ++i) {
+    // Stage 1: every GPU copies its local contribution to pinned host memory.
+    for (int i = 0; i < (int) p->n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
         GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
@@ -625,7 +756,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // host_large_read_done[peer] = peer finished reading host_large[i].
         // No-op on the first AR -- no prior record exists.
         if (p->host_large_read_done_valid) {
-            const int peer = 1 - i;
+            const int peer = i ^ peer_xor;
             CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
         }
 
@@ -652,8 +783,8 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     // stays pure-copy and avoids an in-stream copy->compute engine switch every
     // AR.  dev_tmp is single-buffered: the AR stream waits cross-stream on the
     // prior AR's add_kernel-done event before overwriting it.
-    for (int i = 0; i < 2; ++i) {
-        const int peer = 1 - i;
+    for (int i = 0; i < (int) p->n_devices; ++i) {
+        const int peer = i ^ peer_xor;
         ggml_cuda_set_device(p->devices[i]);
 
         // Wait for the previous AR's add_kernel (on the compute stream) to
@@ -719,7 +850,8 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
         T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
         T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
         const bool              compute[GGML_CUDA_MAX_DEVICES],
-        int64_t                 ne) {
+        int64_t                 ne,
+        const int               peer_xor) {
     const int64_t outer_max_elems = (int64_t) (p->copy_bytes / sizeof(T_src));
     GGML_ASSERT(outer_max_elems > 0);
 
@@ -734,20 +866,32 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
             src[i] = src_buf[i] + outer_start;
             dst[i] = dst_buf[i] + outer_start;
         }
-        ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(
-            p, backends, src, dst, compute, outer_ne, outer_nbytes);
+        static const bool use_p2p = [](){
+            const char * v = getenv("GGML_CUDA_AR_P2P");
+            return v != nullptr && atoi(v) != 0; // opt-in: cross-root pairs are slower over
+                                                  // direct P2P than the staged host path
+        }();
+        if (use_p2p) {
+            ok = ggml_cuda_ar_allreduce_copy_impl_p2p<T_src, T_dst>(
+                p, backends, src, dst, compute, outer_ne, outer_nbytes, peer_xor);
+        } else {
+            ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(
+                p, backends, src, dst, compute, outer_ne, outer_nbytes, peer_xor);
+        }
     }
     return ok;
 }
 
-bool ggml_cuda_ar_allreduce(
+static bool ggml_cuda_ar_allreduce_round(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
-        ggml_tensor           ** tensors) {
+        ggml_tensor           ** tensors,
+        const int               peer_xor,
+        const bool            * compute_override) {
     GGML_ASSERT(p != nullptr);
 
     const int n = p->n_devices;
-    GGML_ASSERT(n == 2);
+    GGML_ASSERT(n == 2 || n == 4);
 
     const ggml_type input_type = tensors[0]->type;
     GGML_ASSERT(input_type == GGML_TYPE_F32 || input_type == GGML_TYPE_F16 || input_type == GGML_TYPE_BF16);
@@ -763,6 +907,7 @@ bool ggml_cuda_ar_allreduce(
     // inner paths see them as already-prepared compute tensors.
     const bool use_bf16 =
         input_type == GGML_TYPE_F32 &&
+        p->n_devices == 2 && // multi-round would need re-conversion between rounds
         p->bf16_threshold > 0 &&
         input_nbytes >= p->bf16_threshold;
 
@@ -773,7 +918,8 @@ bool ggml_cuda_ar_allreduce(
 
     bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};
     for (int i = 0; i < n; ++i) {
-        compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        compute_flag[i] = compute_override ? compute_override[i]
+                                           : (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
 
     // Decide between copy-engine and chunked kernel paths based on the working
@@ -846,7 +992,7 @@ bool ggml_cuda_ar_allreduce(
                 dst[i] = static_cast<float *>(tensors[i]->data);
             }
             ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, float>(
-                p, backends, src, dst, inner_compute, ne);
+                p, backends, src, dst, inner_compute, ne, peer_xor);
         } else {
             switch (kernel_type) {
                 case GGML_TYPE_F32: {
@@ -855,7 +1001,7 @@ bool ggml_cuda_ar_allreduce(
                         buf[i] = static_cast<float *>(tensors[i]->data);
                     }
                     ok = ggml_cuda_ar_allreduce_copy_outer<float, float>(
-                        p, backends, buf, buf, inner_compute, ne);
+                        p, backends, buf, buf, inner_compute, ne, peer_xor);
                     break;
                 }
                 case GGML_TYPE_BF16: {
@@ -864,7 +1010,7 @@ bool ggml_cuda_ar_allreduce(
                         buf[i] = static_cast<nv_bfloat16 *>(tensors[i]->data);
                     }
                     ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, nv_bfloat16>(
-                        p, backends, buf, buf, inner_compute, ne);
+                        p, backends, buf, buf, inner_compute, ne, peer_xor);
                     break;
                 }
                 case GGML_TYPE_F16: {
@@ -873,7 +1019,7 @@ bool ggml_cuda_ar_allreduce(
                         buf[i] = static_cast<half *>(tensors[i]->data);
                     }
                     ok = ggml_cuda_ar_allreduce_copy_outer<half, half>(
-                        p, backends, buf, buf, inner_compute, ne);
+                        p, backends, buf, buf, inner_compute, ne, peer_xor);
                     break;
                 }
                 default:
@@ -901,7 +1047,7 @@ bool ggml_cuda_ar_allreduce(
             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
 
             for (int i = 0; i < n; ++i) {
-                const int peer = 1 - i;  // valid for n == 2 only
+                const int peer = i ^ peer_xor;
                 ggml_cuda_set_device(p->devices[i]);
                 auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
                 GGML_ASSERT(cuda_ctx->device == p->devices[i]);
@@ -950,6 +1096,33 @@ bool ggml_cuda_ar_allreduce(
     }
 
     return ok;
+}
+
+
+bool ggml_cuda_ar_allreduce(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    GGML_ASSERT(p != nullptr);
+    const int n = p->n_devices;
+    GGML_ASSERT(n == 2 || n == 4);
+
+    // Recursive doubling: log2(n) rounds of the pairwise exchange engine.
+    // Round r pairs device i with i^(1<<r). After round 0 every device holds
+    // its pair's partial sum, so later rounds treat all shards as compute.
+    const int n_rounds = n == 2 ? 1 : 2;
+    bool all_compute[GGML_CUDA_MAX_DEVICES];
+    for (int i = 0; i < n; ++i) {
+        all_compute[i] = true;
+    }
+    for (int round = 0; round < n_rounds; ++round) {
+        const int    peer_xor = 1 << round;
+        const bool * override = round > 0 ? all_compute : nullptr;
+        if (!ggml_cuda_ar_allreduce_round(p, backends, tensors, peer_xor, override)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 #else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
