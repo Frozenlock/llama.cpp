@@ -182,6 +182,10 @@ std::unique_ptr<llm_graph_context> llama_model_glm_dsa::build_arch_graph(const l
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
+    // NOTE: dispatching llama_model_deepseek2::graph here segfaults post-25407
+    // (the glm-dsa KV cache now carries indexer state the deepseek2 graph does
+    // not understand). A dense/DSA toggle must gate the indexer INSIDE this
+    // graph instead.
     return std::make_unique<graph>(*this, params);
 }
 
@@ -369,6 +373,11 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
                 // mask indexer scores
                 ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
+                if (indexer_kq_mask->type != GGML_TYPE_F32) {
+                    // with flash attention the mask is f16; the f32+f16 broadcast
+                    // add is unsupported on CUDA (binbcast alignment assert)
+                    indexer_kq_mask = ggml_cast(ctx0, indexer_kq_mask, GGML_TYPE_F32);
+                }
                 indexer_score = ggml_add(ctx0, indexer_score, indexer_kq_mask);
                 cb(indexer_score, "indexer_score", il);
 
