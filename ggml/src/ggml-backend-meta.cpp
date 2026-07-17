@@ -1596,7 +1596,17 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
+        if (bufs.back() == nullptr) {
+            // propagate allocation failure so callers (e.g. the scheduler's
+            // pipeline-parallel reserve) can retry with a smaller footprint
+            // instead of aborting the process
+            for (ggml_backend_buffer_t b : bufs) {
+                if (b != nullptr) {
+                    ggml_backend_buffer_free(b);
+                }
+            }
+            return nullptr;
+        }
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
