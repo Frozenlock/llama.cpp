@@ -1130,7 +1130,9 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
 
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
     if (buffer == NULL) {
-        GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);
+        GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu (first tensor: '%s', last tensor: '%s')\n",
+                       __func__, ggml_backend_buft_name(buft), size,
+                       first != NULL ? first->name : "?", last != NULL ? last->name : "?");
         free_buffers(buffers, n_buffers);
         return false;
     }

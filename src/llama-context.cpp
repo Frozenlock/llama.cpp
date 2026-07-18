@@ -431,6 +431,10 @@ llama_context::llama_context(
             (model.split_mode() == LLAMA_SPLIT_MODE_LAYER ||
              (pp_pipeline_env && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR)) &&
             cparams.offload_kqv &&
+            // MTP/draft contexts decode small batches only; pipelining just
+            // multiplies their compute buffers by GGML_SCHED_MAX_COPIES
+            // (measured: 6x 243 MiB -> OOM for the TP4 MTP context at 48K).
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
             !model.has_tensor_overrides();
 
         // pipeline parallelism requires support for async compute and events in all devices
