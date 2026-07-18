@@ -1748,7 +1748,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    // Runtime copy-count override: GGML_SCHED_COPIES=<n> clamps below the
+    // compile-time ceiling, replacing per-copy-count builds (mc4/mc6).
+    int max_copies = GGML_SCHED_MAX_COPIES;
+    if (const char * env = getenv("GGML_SCHED_COPIES")) {
+        const int v = atoi(env);
+        if (v >= 1 && v <= GGML_SCHED_MAX_COPIES) {
+            max_copies = v;
+        }
+    }
+    sched->n_copies = parallel ? max_copies : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
