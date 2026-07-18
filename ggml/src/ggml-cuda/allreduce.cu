@@ -114,6 +114,9 @@ static __global__ void ggml_cuda_ar_kernel(
         int                         count,
         int *                       arrival_mine,
         int *                       arrival_other,
+        const int *                 ack_for_mine,
+        int *                       ack_for_other,
+        int                         prev_token,
         int                         token) {
 
     // Vector unit for the wire type, sized to the arch's widest single-instruction
@@ -129,6 +132,25 @@ static __global__ void ggml_cuda_ar_kernel(
     const int gnt       = gridDim.x * nt;
     const int count_vec = count / ELEMS_PER_VEC;
     const int tail      = count_vec * ELEMS_PER_VEC;
+
+    // Phase 0: slot-reuse guard.  Before overwriting host_mine[slot], wait for
+    // the reader of the slot's previous tenant (token prev_token) to ack that
+    // its reads completed.  This makes the ring safe at any host-enqueue depth
+    // (the host no longer synchronizes in acquire_slot), and, combined with
+    // phase 2's exact-token match, guarantees an arrival token can never be
+    // clobbered before its partner observes it.  prev_token == 0 means the
+    // slot has no previous tenant (first lap).
+    if (prev_token != 0 && tid == 0) {
+        const int * ack_slot = ack_for_mine + bid * ARRIVAL_INTS;
+        while (ggml_cuda_ar_signal_get(ack_slot) < prev_token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        }
+    }
+    __syncthreads();
 
     // Phase 1: cast sendbuf (T_dst) -> host_mine (T_wire) and store as vectors.
     {
@@ -194,6 +216,15 @@ static __global__ void ggml_cuda_ar_kernel(
                 ggml_cuda_cast<float>(d_low) +
                 ggml_cuda_cast<float>(host_other[tail + tid]));
         }
+    }
+
+    // Phase 4: ack our reads of host_other so the peer's next tenant of this
+    // slot may overwrite it.  __syncthreads ensures every thread in the block
+    // has consumed its stripe before thread 0 publishes the ack.
+    __syncthreads();
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(ack_for_other + bid * ARRIVAL_INTS, token);
+        __threadfence_system();
     }
 }
 
@@ -329,8 +360,14 @@ struct ggml_cuda_ar_pipeline {
 
     // Arrival ring: ARRIVAL_STRIDE bytes between adjacent ints.  Mapped pinned
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
-    // Use ggml_cuda_ar_arrival_ptr() to index.
+    // Use ggml_cuda_ar_arrival_ptr() to index.  Second half of the same
+    // allocation is the read-ack ring (ggml_cuda_ar_ack_ptr).
     ggml_cuda_ar_host_mapping arrival;
+
+    // Host bookkeeping for the chunked path's slot-reuse guard: the token of
+    // each slot's previous chunked-kernel tenant (0 = none yet).  Only the
+    // chunked path touches arrival/ack slots, so only it advances this.
+    int last_chunked_token[GGML_CUDA_AR_POOL_SIZE];
 };
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
@@ -339,6 +376,18 @@ static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot,
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + offset);
+}
+
+// Read-ack ring: same geometry as the arrival ring, in the second half of the
+// same mapped allocation.  ack(slot, rank) is written by the READER of rank's
+// host_buf[slot] (with the reader's token) and spun on by rank's next kernel
+// before it overwrites that slot.
+static int * ggml_cuda_ar_ack_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
+    const size_t half = (size_t)GGML_CUDA_AR_POOL_SIZE * p->n_devices *
+                        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    const size_t offset = ((size_t)slot * p->n_devices + rank) *
+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(p->arrival.dev + half + offset);
 }
 
 static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
@@ -353,23 +402,40 @@ static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) 
 }
 
 struct ggml_cuda_ar_slot_info {
-    int slot;
-    int token;
+    int  slot;
+    int  token;
+    bool pool_lapped;
 };
 
+// Non-blocking slot acquisition.  The former cudaEventSynchronize here was a
+// host block on GPU progress; with the sched pipelining ubatches across
+// TP x PP stages, a single host thread drives every stage, so any host block
+// inside one stage's AR serializes the whole pipeline (measured: TP2 prefill
+// 441 -> 220).  Slot-reuse protection is instead expressed on-stream by the
+// callers:
+//   - chunked kernel path: cudaStreamWaitEvent on the peer's ev.ker (its read
+//     of our host_buf[slot] from AR N-2) before relaunching on that slot;
+//     own-stream ordering covers our writer.
+//   - copy-engine / P2P paths: already fenced via host_large_read_done /
+//     dev_tmp_kernel_done stream events; slot only rotates event objects.
+// Event-object reuse without the host sync is safe: every wait referencing
+// the previous record is enqueued (by this same host thread) before the
+// re-record, and cudaStreamWaitEvent snapshots the record it targets.
+// GGML_CUDA_AR_BLOCKING=1 restores the old host-synchronous behavior.
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
 
-    if (pool_lapped) {
+    static const bool blocking = getenv("GGML_CUDA_AR_BLOCKING") != nullptr;
+    if (blocking && pool_lapped) {
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
             CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
         }
     }
 
-    return { slot, (int) p->call_count };
+    return { slot, (int) p->call_count, pool_lapped };
 }
 
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
@@ -522,9 +588,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
-    // Arrival ring: cache-line padded so each GPU's int is on its own line.
+    // Arrival ring + read-ack ring (second half): cache-line padded so each
+    // GPU's int is on its own line.
     const size_t arrival_bytes =
-        (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
+        2 * (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
         GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
@@ -1043,8 +1110,15 @@ static bool ggml_cuda_ar_allreduce_round(
             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
             const size_t chunk_dst_bytes  = chunk_elems * input_type_size;
 
-            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+            const auto [slot, token, pool_lapped] = ggml_cuda_ar_acquire_slot(p);
+            GGML_UNUSED(pool_lapped);
             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
+
+            // Slot-reuse flow control is done inside the kernel (phase 0 spins
+            // on the previous tenant's read-ack; phase 4 publishes ours), so
+            // the host never blocks and the sched can pipeline stages freely.
+            const int prev_token = p->last_chunked_token[slot];
+            p->last_chunked_token[slot] = token;
 
             for (int i = 0; i < n; ++i) {
                 const int peer = i ^ peer_xor;
@@ -1071,6 +1145,9 @@ static bool ggml_cuda_ar_allreduce_round(
                     static_cast<int>(chunk_elems), \
                     ggml_cuda_ar_arrival_ptr(p, slot, i), \
                     ggml_cuda_ar_arrival_ptr(p, slot, peer), \
+                    ggml_cuda_ar_ack_ptr(p, slot, i), \
+                    ggml_cuda_ar_ack_ptr(p, slot, peer), \
+                    prev_token, \
                     token)
 
                 if (use_bf16) {
