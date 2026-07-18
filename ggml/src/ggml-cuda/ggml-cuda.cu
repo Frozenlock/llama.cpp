@@ -1075,7 +1075,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends == 2);
+    GGML_ASSERT(n_backends == 2 || n_backends == 4);
     GGML_ASSERT(tensors[0] != nullptr);
 
     const int64_t   ne   = ggml_nelements(tensors[0]);
@@ -1132,6 +1132,21 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
 
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    // Hybrid dispatch: the internal engine's slot ring host-blocks, which
+    // serializes TP x PP pipeline stages during prefill.  Above the size
+    // threshold, defer to the meta-backend butterfly (fully stream-async) so
+    // ubatch pipelining can overlap stages; below it, keep the internal
+    // kernel's lower per-call latency for decode.
+    // GGML_CUDA_AR_BUTTERFLY_MIN_BYTES overrides the threshold (0 = never
+    // defer, i.e. previous behavior).
+    static const size_t butterfly_min_bytes = [] {
+        const char * env = getenv("GGML_CUDA_AR_BUTTERFLY_MIN_BYTES");
+        return env != nullptr ? (size_t) strtoull(env, nullptr, 10) : (size_t) (1u << 20);
+    }();
+    if (butterfly_min_bytes > 0 && tensors[0] != nullptr &&
+            ggml_nbytes(tensors[0]) >= butterfly_min_bytes) {
+        return false;
+    }
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
