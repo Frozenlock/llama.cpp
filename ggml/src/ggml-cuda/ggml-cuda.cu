@@ -1139,9 +1139,14 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
     // kernel's lower per-call latency for decode.
     // GGML_CUDA_AR_BUTTERFLY_MIN_BYTES overrides the threshold (0 = never
     // defer, i.e. previous behavior).
+    // Default 0 (never defer): with the non-blocking slot ring the internal
+    // engine beats the butterfly at every tensor size (GLM TP2 pp8192 451.2
+    // vs 447.7, tg equal; TP4 350.3 vs 224.0).  The hand-off remains
+    // available for configurations where the internal engine's exchange
+    // topology loses to the butterfly's.
     static const size_t butterfly_min_bytes = [] {
         const char * env = getenv("GGML_CUDA_AR_BUTTERFLY_MIN_BYTES");
-        return env != nullptr ? (size_t) strtoull(env, nullptr, 10) : (size_t) (1u << 20);
+        return env != nullptr ? (size_t) strtoull(env, nullptr, 10) : (size_t) 0;
     }();
     if (butterfly_min_bytes > 0 && tensors[0] != nullptr &&
             ggml_nbytes(tensors[0]) >= butterfly_min_bytes) {
