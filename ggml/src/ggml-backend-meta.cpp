@@ -1710,6 +1710,29 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // Outer-capture (whole-subgraph-sequence CUDA graph) hooks, fetched from
+    // the simple backend's registry.  All-or-nothing: capture_* stay null if
+    // the backend doesn't provide the full set.
+    bool   (*capture_begin)(ggml_backend_t)          = nullptr;
+    void * (*capture_end)(ggml_backend_t)            = nullptr;
+    bool   (*capture_launch)(ggml_backend_t, void *) = nullptr;
+    void   (*capture_free)(ggml_backend_t, void *)   = nullptr;
+    void   (*capture_abort)(ggml_backend_t)          = nullptr;
+
+    // Cached captured graphs, keyed by cgraph uid.  uids are monotonic and
+    // never reused, so a stale entry can never be matched again; evict oldest
+    // beyond a small cap (spec-decode verify passes cycle a few shapes).
+    struct outer_graph_entry {
+        uint64_t            uid  = 0;
+        int                 warm = 0;
+        bool                capturable = true;
+        std::vector<void *> execs; // one per simple backend; empty until captured
+        uint64_t            last_used = 0;
+    };
+    std::vector<outer_graph_entry> outer_graphs;
+    uint64_t                       outer_graph_clock   = 0;
+    bool                           outer_graph_enabled = false;
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1741,9 +1764,26 @@ struct ggml_backend_meta_context {
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
+
+        if (comm_ctx != nullptr && getenv("GGML_META_GRAPH_OFF") == nullptr) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            capture_begin  = (bool   (*)(ggml_backend_t))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_begin");
+            capture_end    = (void * (*)(ggml_backend_t))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_end");
+            capture_launch = (bool   (*)(ggml_backend_t, void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_launch");
+            capture_free   = (void   (*)(ggml_backend_t, void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
+            capture_abort  = (void   (*)(ggml_backend_t))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_abort");
+            outer_graph_enabled = capture_begin && capture_end && capture_launch && capture_free && capture_abort;
+        }
     }
 
     ~ggml_backend_meta_context() {
+        for (auto & e : outer_graphs) {
+            for (size_t j = 0; j < e.execs.size(); j++) {
+                if (e.execs[j] != nullptr && capture_free != nullptr) {
+                    capture_free(backend_configs[j].backend, e.execs[j]);
+                }
+            }
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2287,6 +2327,109 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         t_start_us = ggml_time_us();
     }
 
+    // -----------------------------------------------------------------------
+    // Outer capture: once a uid has run enough passes for every inner CUDA
+    // graph to be warmed, capture the whole per-device enqueue sequence
+    // (subgraph computes + graph-safe allreduces) into one executable graph
+    // per device and replay it with a single launch per pass.  Capturable
+    // only when every AR boundary tensor fits the graph-mode slot ring --
+    // prefill passes never qualify, decode/verify passes do.
+    // -----------------------------------------------------------------------
+    ggml_backend_meta_context::outer_graph_entry * og = nullptr;
+    bool outer_capture_active = false;
+
+    if (backend_ctx->outer_graph_enabled && cgraph->uid != 0 && backend_ctx->comm_ctx != nullptr &&
+            n_backends > 1 && n_backends <= 4 && backend_ctx->n_subgraphs > 1 &&
+            !tp_spike_dump && !tp_spike_timing) {
+        for (auto & e : backend_ctx->outer_graphs) {
+            if (e.uid == cgraph->uid) {
+                og = &e;
+                break;
+            }
+        }
+        if (og == nullptr) {
+            if (backend_ctx->outer_graphs.size() >= 16) {
+                size_t lru = 0;
+                for (size_t k = 1; k < backend_ctx->outer_graphs.size(); k++) {
+                    if (backend_ctx->outer_graphs[k].last_used < backend_ctx->outer_graphs[lru].last_used) {
+                        lru = k;
+                    }
+                }
+                auto & ev = backend_ctx->outer_graphs[lru];
+                for (size_t j = 0; j < ev.execs.size(); j++) {
+                    if (ev.execs[j] != nullptr) {
+                        backend_ctx->capture_free(backend_ctx->backend_configs[j].backend, ev.execs[j]);
+                    }
+                }
+                backend_ctx->outer_graphs.erase(backend_ctx->outer_graphs.begin() + lru);
+            }
+            backend_ctx->outer_graphs.emplace_back();
+            og = &backend_ctx->outer_graphs.back();
+            og->uid = cgraph->uid;
+            // Capturability: every boundary (PARTIAL) node must fit the
+            // graph-mode AR staging slot (256 KB), sized for decode/verify.
+            auto & bc0 = backend_ctx->backend_configs[0];
+            for (size_t i = 0; i + 1 < backend_ctx->n_subgraphs && og->capturable; i++) {
+                ggml_cgraph * cg = bc0.cgraphs[i].cgraph_main;
+                if (cg->n_nodes < 1 || ggml_nbytes(cg->nodes[cg->n_nodes - 1]) > 256 * 1024) {
+                    og->capturable = false;
+                }
+            }
+        }
+        og->last_used = ++backend_ctx->outer_graph_clock;
+
+        static const bool mg_debug = getenv("GGML_META_GRAPH_DEBUG") != nullptr;
+        if (mg_debug) {
+            static int dbg_n = 0;
+            if (dbg_n < 60 || dbg_n % 500 == 0) {
+                fprintf(stderr, "MG: uid=%llu warm=%d execs=%zu cap=%d nsub=%zu entries=%zu\n",
+                        (unsigned long long) cgraph->uid, og->warm, og->execs.size(),
+                        (int) og->capturable, backend_ctx->n_subgraphs, backend_ctx->outer_graphs.size());
+            }
+            dbg_n++;
+        }
+
+        if (!og->execs.empty()) {
+            bool ok = true;
+            for (size_t j = 0; j < n_backends && ok; j++) {
+                ok = backend_ctx->capture_launch(backend_ctx->backend_configs[j].backend, og->execs[j]);
+            }
+            if (ok) {
+                return GGML_STATUS_SUCCESS;
+            }
+            for (size_t j = 0; j < og->execs.size(); j++) {
+                if (og->execs[j] != nullptr) {
+                    backend_ctx->capture_free(backend_ctx->backend_configs[j].backend, og->execs[j]);
+                }
+            }
+            og->execs.clear();
+            og->capturable = false;
+        } else if (og->capturable && og->warm >= 3) {
+            bool ok = true;
+            size_t begun = 0;
+            for (size_t j = 0; j < n_backends && ok; j++) {
+                ok = backend_ctx->capture_begin(backend_ctx->backend_configs[j].backend);
+                if (ok) {
+                    begun++;
+                }
+            }
+            if (!ok) {
+                for (size_t j = 0; j < begun; j++) {
+                    backend_ctx->capture_abort(backend_ctx->backend_configs[j].backend);
+                }
+                og->capturable = false;
+            } else {
+                outer_capture_active = true;
+            }
+        } else {
+            og->warm++;
+        }
+    }
+
+    const size_t iga0 = iga;
+    const size_t ina0 = ina;
+    for (int pass = 0; ; pass++) {
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const int64_t t0 = tp_spike_timing ? ggml_time_us() : 0;
         for (size_t j = 0; j < n_backends; j++) {
@@ -2353,6 +2496,44 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             t_reduce_us += t2 - t1;
         }
     }
+
+    if (!outer_capture_active) {
+        break;
+    }
+    // End capture on every device and instantiate.  Capture only records --
+    // nothing has executed yet on ANY device -- so an end/instantiate failure
+    // can be recovered by re-running the whole pass eagerly.
+    {
+        og->execs.assign(n_backends, nullptr);
+        bool end_ok = true;
+        for (size_t j = 0; j < n_backends; j++) {
+            og->execs[j] = backend_ctx->capture_end(backend_ctx->backend_configs[j].backend);
+            end_ok = end_ok && og->execs[j] != nullptr;
+        }
+        if (end_ok) {
+            // Execute this pass for real via the freshly captured graphs.
+            for (size_t j = 0; j < n_backends; j++) {
+                if (!backend_ctx->capture_launch(backend_ctx->backend_configs[j].backend, og->execs[j])) {
+                    GGML_ABORT("meta outer-graph launch failed right after instantiate");
+                }
+            }
+            break;
+        }
+        for (size_t j = 0; j < og->execs.size(); j++) {
+            if (og->execs[j] != nullptr) {
+                backend_ctx->capture_free(backend_ctx->backend_configs[j].backend, og->execs[j]);
+            }
+        }
+        og->execs.clear();
+        og->capturable = false;
+        outer_capture_active = false;
+        iga = iga0;
+        ina = ina0;
+        GGML_ASSERT(pass == 0);
+        // fall through: loop again, executing eagerly this time
+    }
+    }
+
     if (tp_spike_timing) {
         // synchronize to attribute the GPU-side tail to this compute call
         for (size_t j = 0; j < n_backends; j++) {

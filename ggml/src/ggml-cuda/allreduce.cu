@@ -412,6 +412,181 @@ static __global__ void ggml_cuda_ar_flat_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Stream-capture (CUDA graph) mode -- device-token flat exchange.
+//
+// When the meta backend captures a whole per-device subgraph sequence into a
+// CUDA graph, the AR must be replayable without any host involvement: the
+// host-side call_count / last_chunked_token bookkeeping advances at enqueue
+// time, but a captured kernel executes arbitrarily many times afterwards.
+// This variant takes its token from a per-block device counter that the
+// kernel itself increments at execution time, derives the slot from token
+// parity (pointers for BOTH slots are baked into the launch args), and uses
+// a DEDICATED staging + arrival/ack region so replays can never desync the
+// host-token chunked/copy paths that non-captured (prefill) ARs keep using.
+// ---------------------------------------------------------------------------
+
+static constexpr int    GGML_CUDA_AR_GRAPH_SLOTS      = 2;
+static constexpr size_t GGML_CUDA_AR_GRAPH_SLOT_BYTES = 256 * 1024; // max wire bytes per AR in captured graphs
+
+template <typename T_wire>
+struct ggml_cuda_ar_graph_args {
+    T_wire * wire_mine[GGML_CUDA_AR_GRAPH_SLOTS];
+    int    * arrival_mine[GGML_CUDA_AR_GRAPH_SLOTS];
+    ggml_cuda_ar_flat_args<T_wire> slot_args[GGML_CUDA_AR_GRAPH_SLOTS];
+};
+
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_flat_graph_kernel(
+        const T_dst *                        sendbuf,
+        T_dst       *                        recvbuf,
+        ggml_cuda_ar_graph_args<T_wire>      gargs,
+        int                                  n_ranks,
+        int                                  my_rank,
+        int                                  active_mask,
+        int                                  count,
+        int         *                        counter) {
+
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+
+    // Token from the device counter: one increment per block per execution.
+    // Graph nodes on one stream execute in enqueue order, so counter[bid] is
+    // single-writer and needs no atomics.
+    __shared__ int s_token;
+    if (tid == 0) {
+        const int t = counter[bid] + 1;
+        counter[bid] = t;
+        s_token = t;
+    }
+    __syncthreads();
+    const int token = s_token;
+    const int slot  = token & 1;
+    const int prev  = token - GGML_CUDA_AR_GRAPH_SLOTS; // previous tenant of this slot
+
+    const ggml_cuda_ar_flat_args<T_wire> & args = gargs.slot_args[slot];
+    T_wire * wire_mine    = gargs.wire_mine[slot];
+    int    * arrival_mine = gargs.arrival_mine[slot];
+
+    // Phase 0: wait for every reader of this slot's previous tenant.
+    if (prev > 0 && tid == 0) {
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            const int * ack_slot = args.ack_in[r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(ack_slot) < prev) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 1: publish my contribution as T_wire.
+    if ((active_mask >> my_rank) & 1) {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T_wire wire[ELEMS_PER_VEC];
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+            }
+            ggml_cuda_memcpy_1<sizeof(wire)>(&wire_mine[off], wire);
+        }
+        if (bid == 0 && tid < count - tail) {
+            wire_mine[tail + tid] = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
+        }
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    // Phase 2: signal my arrival; wait for every peer's.
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(arrival_mine + bid * ARRIVAL_INTS, token);
+        __threadfence_system();
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            const int * slot_p = args.arrival[r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(slot_p) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            }
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+
+    // Phase 3: fixed-rank-order sum.
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        float acc[ELEMS_PER_VEC] = {};
+        for (int r = 0; r < n_ranks; ++r) {
+            if (!((active_mask >> r) & 1)) {
+                continue;
+            }
+            if (r == my_rank) {
+                #pragma unroll
+                for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                    acc[k] += ggml_cuda_cast<float>(ggml_cuda_cast<T_wire>(sendbuf[off + k]));
+                }
+            } else {
+                T_wire wire[ELEMS_PER_VEC];
+                ggml_cuda_memcpy_1<sizeof(wire)>(wire, &args.wire[r][off]);
+                #pragma unroll
+                for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                    acc[k] += ggml_cuda_cast<float>(wire[k]);
+                }
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            recvbuf[off + k] = ggml_cuda_cast<T_dst>(acc[k]);
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        float acc = 0.0f;
+        for (int r = 0; r < n_ranks; ++r) {
+            if (!((active_mask >> r) & 1)) {
+                continue;
+            }
+            acc += r == my_rank
+                ? ggml_cuda_cast<float>(ggml_cuda_cast<T_wire>(sendbuf[tail + tid]))
+                : ggml_cuda_cast<float>(args.wire[r][tail + tid]);
+        }
+        recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(acc);
+    }
+
+    // Phase 4: ack every peer's buffer.
+    __syncthreads();
+    if (tid == 0) {
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            ggml_cuda_ar_signal_set(args.ack_out[r] + bid * ARRIVAL_INTS, token);
+        }
+        __threadfence_system();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
 
@@ -538,6 +713,13 @@ struct ggml_cuda_ar_pipeline {
     // starting, so two of them can never be in flight at once.
     cudaEvent_t root_pull_chain;
     bool        root_pull_chain_valid;
+
+    // Stream-capture (graph) mode resources -- fully disjoint from the paths
+    // above: mapped staging per device, one shared arrival+ack control block,
+    // and a per-device per-block execution counter in device memory.
+    ggml_cuda_ar_host_mapping graph_buf[GGML_CUDA_MAX_DEVICES]; // GRAPH_SLOTS * GRAPH_SLOT_BYTES each
+    ggml_cuda_ar_host_mapping graph_ctrl;                       // arrival + ack regions
+    int *                     graph_counter[GGML_CUDA_MAX_DEVICES]; // KERNEL_BLOCKS ints, device mem
 };
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
@@ -558,6 +740,25 @@ static int * ggml_cuda_ar_ack_ptr(const ggml_cuda_ar_pipeline * p, int slot, int
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + half + offset);
+}
+
+// Graph-mode control block: region 1 = arrival per (slot, rank), region 2 =
+// ack per (slot, owner, reader).  Same cache-line geometry as the main rings.
+static int * ggml_cuda_ar_graph_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
+    const size_t offset = ((size_t)slot * p->n_devices + rank) *
+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(p->graph_ctrl.dev + offset);
+}
+static int * ggml_cuda_ar_graph_ack_ptr(const ggml_cuda_ar_pipeline * p, int slot, int owner, int reader) {
+    const size_t base = (size_t)GGML_CUDA_AR_GRAPH_SLOTS * p->n_devices *
+                        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    const size_t offset = (((size_t)slot * p->n_devices + owner) * p->n_devices + reader) *
+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(p->graph_ctrl.dev + base + offset);
+}
+static size_t ggml_cuda_ar_graph_ctrl_bytes(size_t n_devices) {
+    return (1 + n_devices) * (size_t)GGML_CUDA_AR_GRAPH_SLOTS * n_devices *
+           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
 }
 
 // Flat-exchange ack ring: per (slot, owner, reader), in the third region of
@@ -822,6 +1023,31 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Stream-capture (graph) mode: dedicated staging + control block + device
+    // counters.  Allocated eagerly -- cudaHostAlloc is illegal mid-capture.
+    {
+        const size_t graph_buf_bytes = (size_t) GGML_CUDA_AR_GRAPH_SLOTS * GGML_CUDA_AR_GRAPH_SLOT_BYTES;
+        const size_t ctrl_bytes      = ggml_cuda_ar_graph_ctrl_bytes(n_devices);
+        bool ok = p->graph_ctrl.alloc(ctrl_bytes) == cudaSuccess;
+        if (ok) {
+            ggml_cuda_set_device(p->devices[0]);
+            ok = cudaMemset(p->graph_ctrl.dev, 0, ctrl_bytes) == cudaSuccess;
+        }
+        for (size_t i = 0; ok && i < n_devices; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            ok = p->graph_buf[i].alloc(graph_buf_bytes) == cudaSuccess &&
+                 cudaMalloc(reinterpret_cast<void **>(&p->graph_counter[i]),
+                            GGML_CUDA_AR_KERNEL_BLOCKS * sizeof(int)) == cudaSuccess &&
+                 cudaMemset(p->graph_counter[i], 0,
+                            GGML_CUDA_AR_KERNEL_BLOCKS * sizeof(int)) == cudaSuccess;
+        }
+        if (!ok) {
+            GGML_LOG_ERROR("%s: graph-mode AR resource allocation failed\n", __func__);
+            ggml_cuda_ar_pipeline_free(p);
+            return nullptr;
+        }
+    }
+
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
@@ -871,6 +1097,14 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             cudaStreamDestroy(p->streams[i]);
         }
     }
+    for (int i = 0; i < p->n_devices; ++i) {
+        p->graph_buf[i].free();
+        if (p->graph_counter[i]) {
+            ggml_cuda_set_device(p->devices[i]);
+            cudaFree(p->graph_counter[i]);
+        }
+    }
+    p->graph_ctrl.free();
     p->arrival.free();
     delete p;
 }
@@ -1514,6 +1748,85 @@ static bool ggml_cuda_ar_allreduce_flat(
     return true;
 }
 
+// Stream-capture mode: launch the device-token flat kernel on every rank's
+// compute stream.  Returns false for inputs the graph path can't take (caller
+// falls back; the meta capture gate should prevent that from ever happening
+// inside an actual capture).
+static bool ggml_cuda_ar_allreduce_flat_graph(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    const int n = p->n_devices;
+    GGML_ASSERT(n <= GGML_CUDA_AR_FLAT_MAX_RANKS);
+
+    const ggml_type input_type   = tensors[0]->type;
+    const int64_t   ne           = ggml_nelements(tensors[0]);
+    const size_t    input_nbytes = ggml_nbytes(tensors[0]);
+
+    if (input_type != GGML_TYPE_F32 && input_type != GGML_TYPE_F16 && input_type != GGML_TYPE_BF16) {
+        return false;
+    }
+    const bool use_bf16 =
+        input_type == GGML_TYPE_F32 &&
+        p->bf16_threshold > 0 &&
+        input_nbytes >= p->bf16_threshold;
+    const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
+    const size_t    nbytes      = (size_t) ne * ggml_type_size(kernel_type);
+
+    if (nbytes > GGML_CUDA_AR_GRAPH_SLOT_BYTES) {
+        return false; // too large for the captured-slot ring; capture gate should have excluded this
+    }
+
+    int active_mask = 0;
+    for (int i = 0; i < n; ++i) {
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            active_mask |= 1 << i;
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+        cudaStream_t stream = cuda_ctx->stream();
+
+#define LAUNCH_FLAT_GRAPH(T_dst, T_wire) \
+        do { \
+            ggml_cuda_ar_graph_args<T_wire> gargs = {}; \
+            for (int s = 0; s < GGML_CUDA_AR_GRAPH_SLOTS; ++s) { \
+                gargs.wire_mine[s]    = reinterpret_cast<T_wire *>(p->graph_buf[i].dev + (size_t) s * GGML_CUDA_AR_GRAPH_SLOT_BYTES); \
+                gargs.arrival_mine[s] = ggml_cuda_ar_graph_arrival_ptr(p, s, i); \
+                for (int r = 0; r < n; ++r) { \
+                    gargs.slot_args[s].wire[r]    = reinterpret_cast<const T_wire *>(p->graph_buf[r].dev + (size_t) s * GGML_CUDA_AR_GRAPH_SLOT_BYTES); \
+                    gargs.slot_args[s].arrival[r] = ggml_cuda_ar_graph_arrival_ptr(p, s, r); \
+                    gargs.slot_args[s].ack_out[r] = ggml_cuda_ar_graph_ack_ptr(p, s, r, i); \
+                    gargs.slot_args[s].ack_in[r]  = ggml_cuda_ar_graph_ack_ptr(p, s, i, r); \
+                } \
+            } \
+            ggml_cuda_ar_flat_graph_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                reinterpret_cast<const T_dst *>(tensors[i]->data), \
+                reinterpret_cast<T_dst *>(tensors[i]->data), \
+                gargs, n, i, active_mask, \
+                static_cast<int>(ne), p->graph_counter[i]); \
+        } while (0)
+
+        if (use_bf16) {
+            LAUNCH_FLAT_GRAPH(float, nv_bfloat16);
+        } else {
+            switch (input_type) {
+                case GGML_TYPE_F32:  LAUNCH_FLAT_GRAPH(float,       float);       break;
+                case GGML_TYPE_F16:  LAUNCH_FLAT_GRAPH(half,        half);        break;
+                case GGML_TYPE_BF16: LAUNCH_FLAT_GRAPH(nv_bfloat16, nv_bfloat16); break;
+                default: GGML_ASSERT(false);
+            }
+        }
+#undef LAUNCH_FLAT_GRAPH
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    return true;
+}
+
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -1521,6 +1834,19 @@ bool ggml_cuda_ar_allreduce(
     GGML_ASSERT(p != nullptr);
     const int n = p->n_devices;
     GGML_ASSERT(n == 2 || n == 4);
+
+    // Under stream capture (meta-level CUDA graph), only the device-token
+    // flat exchange is replay-safe: every other path advances host-side
+    // bookkeeping (call_count, slot tokens, event chains) at enqueue time.
+    {
+        auto * ctx0 = static_cast<ggml_backend_cuda_context *>(backends[0]->context);
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(ctx0->stream(), &cs) == cudaSuccess &&
+            cs != cudaStreamCaptureStatusNone) {
+            return ggml_cuda_ar_allreduce_flat_graph(p, backends, tensors);
+        }
+        (void) cudaGetLastError();
+    }
 
     // Small n=4 reductions: single flat exchange round.
     if (n == 4 && ggml_cuda_ar_allreduce_flat(p, backends, tensors)) {

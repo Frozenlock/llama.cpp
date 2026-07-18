@@ -4129,6 +4129,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
+    // Meta-level outer capture: when our compute stream is already being
+    // captured (by the meta backend wrapping a whole subgraph sequence), the
+    // per-subgraph graph machinery must stand down -- nested BeginCapture and
+    // Instantiate are illegal, and cudaGraphLaunch would embed a frozen child.
+    // Eager kernel launches record cleanly into the outer capture instead.
+    {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(cuda_ctx->stream(), &cs) == cudaSuccess &&
+            cs != cudaStreamCaptureStatusNone) {
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, nullptr);
+            return GGML_STATUS_SUCCESS;
+        }
+        (void) cudaGetLastError();
+    }
+
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -5318,10 +5333,95 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Meta-level outer-capture hooks: capture a backend's whole enqueue sequence
+// (multiple subgraph computes + graph-safe allreduces) into one executable
+// CUDA graph, replayed with a single launch per token.  Backend-agnostic
+// callers (ggml-backend-meta.cpp) reach these via get_proc_address.
+static bool ggml_backend_cuda_capture_begin(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const cudaError_t err = cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed);
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: cudaStreamBeginCapture failed: %s\n", __func__, cudaGetErrorString(err));
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaGraph_t graph = nullptr;
+    if (cudaStreamEndCapture(cuda_ctx->stream(), &graph) != cudaSuccess || graph == nullptr) {
+        GGML_LOG_WARN("%s: cudaStreamEndCapture failed\n", __func__);
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    cudaGraphExec_t instance = nullptr;
+    const cudaError_t err = cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0);
+    cudaGraphDestroy(graph);
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: cudaGraphInstantiate failed: %s\n", __func__, cudaGetErrorString(err));
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return (void *) instance;
+}
+
+static bool ggml_backend_cuda_capture_launch(ggml_backend_t backend, void * exec) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const cudaError_t err = cudaGraphLaunch((cudaGraphExec_t) exec, cuda_ctx->stream());
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: cudaGraphLaunch failed: %s\n", __func__, cudaGetErrorString(err));
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_cuda_capture_free(ggml_backend_t backend, void * exec) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaGraphExecDestroy((cudaGraphExec_t) exec);
+}
+
+// Abort an in-progress capture without instantiating (failure path).
+static void ggml_backend_cuda_capture_abort(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cuda_ctx->stream(), &cs) == cudaSuccess &&
+        cs != cudaStreamCaptureStatusNone) {
+        cudaGraph_t graph = nullptr;
+        cudaStreamEndCapture(cuda_ctx->stream(), &graph);
+        if (graph) {
+            cudaGraphDestroy(graph);
+        }
+    }
+    (void) cudaGetLastError();
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_capture_begin") == 0) {
+        return (void *)ggml_backend_cuda_capture_begin;
+    }
+    if (strcmp(name, "ggml_backend_capture_end") == 0) {
+        return (void *)ggml_backend_cuda_capture_end;
+    }
+    if (strcmp(name, "ggml_backend_capture_launch") == 0) {
+        return (void *)ggml_backend_cuda_capture_launch;
+    }
+    if (strcmp(name, "ggml_backend_capture_free") == 0) {
+        return (void *)ggml_backend_cuda_capture_free;
+    }
+    if (strcmp(name, "ggml_backend_capture_abort") == 0) {
+        return (void *)ggml_backend_cuda_capture_abort;
     }
     if (strcmp(name, "ggml_backend_comm_free") == 0) {
         return (void *)ggml_backend_cuda_comm_free;
