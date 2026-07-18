@@ -972,9 +972,12 @@ static bool ggml_cuda_ar_allreduce_round(
     // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
     // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
     // inner paths see them as already-prepared compute tensors.
+    // Multi-round (n=4) is fine: this gate lives in the per-round function, so
+    // each recursive-doubling round re-converts fresh from the F32 accumulator,
+    // and the reduce formula is commutative (a+b == b+a after identical
+    // T_wire rounding on both sides), so all ranks stay bit-equivalent.
     const bool use_bf16 =
         input_type == GGML_TYPE_F32 &&
-        p->n_devices == 2 && // multi-round would need re-conversion between rounds
         p->bf16_threshold > 0 &&
         input_nbytes >= p->bf16_threshold;
 
