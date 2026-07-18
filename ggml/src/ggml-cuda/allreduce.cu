@@ -249,6 +249,169 @@ static __global__ void ggml_cuda_ar_add_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Flat n-way exchange (single round) -- small tensors, n <= 4 ranks.
+//
+// Recursive doubling costs log2(n) sequential handshake rounds; for decode-
+// sized tensors the handshake latency dominates the wire bytes, so a single
+// round where every rank publishes once and then reads ALL peers directly is
+// faster despite moving (n-1)x the bytes.  Each rank sums the n contributions
+// in fixed rank order (0..n-1), rounding every contribution through T_wire,
+// so all ranks produce bit-identical results.
+//
+// Flow control mirrors the pairwise kernel: exact-token arrival match plus a
+// per-(owner, reader) read-ack ring consulted before a slot is overwritten.
+// ---------------------------------------------------------------------------
+
+static constexpr int GGML_CUDA_AR_FLAT_MAX_RANKS = 4;
+
+template <typename T_wire>
+struct ggml_cuda_ar_flat_args {
+    const T_wire * wire[GGML_CUDA_AR_FLAT_MAX_RANKS];      // each rank's published buffer
+    const int    * arrival[GGML_CUDA_AR_FLAT_MAX_RANKS];   // each rank's arrival base
+    int          * ack_out[GGML_CUDA_AR_FLAT_MAX_RANKS];   // ack(slot, owner, me): I ack owner's buffer
+    const int    * ack_in[GGML_CUDA_AR_FLAT_MAX_RANKS];    // ack(slot, me, reader): readers ack my buffer
+};
+
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_flat_kernel(
+        const T_dst *                     sendbuf,
+        T_dst       *                     recvbuf,
+        T_wire      * __restrict__        wire_mine,
+        int         *                     arrival_mine,
+        ggml_cuda_ar_flat_args<T_wire>    args,
+        int                               n_ranks,
+        int                               my_rank,
+        int                               active_mask,
+        int                               count,
+        int                               prev_token,
+        int                               token) {
+
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+
+    // Phase 0: wait for every reader of this slot's previous tenant.
+    if (prev_token != 0 && tid == 0) {
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            const int * ack_slot = args.ack_in[r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(ack_slot) < prev_token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            }
+        }
+    }
+    __syncthreads();
+
+    // Phase 1: publish my contribution as T_wire.  Inactive ranks publish
+    // nothing (they are excluded from every rank's sum) but still take part
+    // in the arrival/ack handshake for flow control.
+    if ((active_mask >> my_rank) & 1) {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T_wire wire[ELEMS_PER_VEC];
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+            }
+            ggml_cuda_memcpy_1<sizeof(wire)>(&wire_mine[off], wire);
+        }
+        if (bid == 0 && tid < count - tail) {
+            wire_mine[tail + tid] = ggml_cuda_cast<T_wire>(sendbuf[tail + tid]);
+        }
+    }
+
+    __threadfence_system();
+    __syncthreads();
+
+    // Phase 2: signal my arrival; wait for every peer's.
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(arrival_mine + bid * ARRIVAL_INTS, token);
+        __threadfence_system();
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            const int * slot = args.arrival[r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(slot) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            }
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+
+    // Phase 3: fixed-rank-order sum; own contribution recomputed from sendbuf
+    // (identical to the published T_wire value) to avoid a PCIe read-back.
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        float acc[ELEMS_PER_VEC] = {};
+        for (int r = 0; r < n_ranks; ++r) {
+            if (!((active_mask >> r) & 1)) {
+                continue;
+            }
+            if (r == my_rank) {
+                #pragma unroll
+                for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                    acc[k] += ggml_cuda_cast<float>(ggml_cuda_cast<T_wire>(sendbuf[off + k]));
+                }
+            } else {
+                T_wire wire[ELEMS_PER_VEC];
+                ggml_cuda_memcpy_1<sizeof(wire)>(wire, &args.wire[r][off]);
+                #pragma unroll
+                for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                    acc[k] += ggml_cuda_cast<float>(wire[k]);
+                }
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            recvbuf[off + k] = ggml_cuda_cast<T_dst>(acc[k]);
+        }
+    }
+    if (bid == 0 && tid < count - tail) {
+        float acc = 0.0f;
+        for (int r = 0; r < n_ranks; ++r) {
+            if (!((active_mask >> r) & 1)) {
+                continue;
+            }
+            acc += r == my_rank
+                ? ggml_cuda_cast<float>(ggml_cuda_cast<T_wire>(sendbuf[tail + tid]))
+                : ggml_cuda_cast<float>(args.wire[r][tail + tid]);
+        }
+        recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(acc);
+    }
+
+    // Phase 4: ack every peer's buffer.
+    __syncthreads();
+    if (tid == 0) {
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            ggml_cuda_ar_signal_set(args.ack_out[r] + bid * ARRIVAL_INTS, token);
+        }
+        __threadfence_system();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
 
@@ -388,6 +551,16 @@ static int * ggml_cuda_ar_ack_ptr(const ggml_cuda_ar_pipeline * p, int slot, int
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + half + offset);
+}
+
+// Flat-exchange ack ring: per (slot, owner, reader), in the third region of
+// the arrival allocation.  reader acks its consumption of owner's buffer.
+static int * ggml_cuda_ar_flat_ack_ptr(const ggml_cuda_ar_pipeline * p, int slot, int owner, int reader) {
+    const size_t base = (size_t)GGML_CUDA_AR_POOL_SIZE * p->n_devices *
+                        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    const size_t offset = (((size_t)slot * p->n_devices + owner) * p->n_devices + reader) *
+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(p->arrival.dev + 2 * base + offset);
 }
 
 static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
@@ -588,10 +761,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
-    // Arrival ring + read-ack ring (second half): cache-line padded so each
-    // GPU's int is on its own line.
+    // Arrival ring + pairwise read-ack ring + flat per-(owner, reader) ack
+    // ring (regions 1..3): cache-line padded so each GPU's int is on its own
+    // line.
     const size_t arrival_bytes =
-        2 * (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
+        (2 + n_devices) * (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
         GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
@@ -1179,6 +1353,116 @@ static bool ggml_cuda_ar_allreduce_round(
 }
 
 
+// Single-round flat exchange for sub-copy-threshold n=4 reductions.  One
+// handshake round instead of log2(n): decode-sized ARs are latency-bound, so
+// reading (n-1)x the bytes beats a second sequential round.  Owns ALL n=4
+// traffic below the copy-engine threshold (chunk loop included) so the
+// pairwise-chunked kernel never shares arrival/ack slots with it -- mixing
+// tenant kinds on a slot would break each other's reuse guards.
+// Returns false only for reductions the copy path should take.
+static bool ggml_cuda_ar_allreduce_flat(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors) {
+    const int n = p->n_devices;
+    GGML_ASSERT(n > 2 && n <= GGML_CUDA_AR_FLAT_MAX_RANKS);
+
+    static const bool flat_enabled = [] {
+        const char * env = getenv("GGML_CUDA_AR_FLAT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!flat_enabled) {
+        return false;
+    }
+
+    const ggml_type input_type   = tensors[0]->type;
+    const int64_t   ne           = ggml_nelements(tensors[0]);
+    const size_t    input_nbytes = ggml_nbytes(tensors[0]);
+
+    if (input_type != GGML_TYPE_F32 && input_type != GGML_TYPE_F16 && input_type != GGML_TYPE_BF16) {
+        return false;
+    }
+
+    const bool use_bf16 =
+        input_type == GGML_TYPE_F32 &&
+        p->bf16_threshold > 0 &&
+        input_nbytes >= p->bf16_threshold;
+    const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
+    const size_t    type_size   = ggml_type_size(kernel_type);
+    const size_t    nbytes      = (size_t) ne * type_size;
+
+    if (p->copy_threshold > 0 && nbytes >= p->copy_threshold) {
+        return false; // bandwidth-bound: copy-engine recursive doubling wins
+    }
+
+    int active_mask = 0;
+    for (int i = 0; i < n; ++i) {
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            active_mask |= 1 << i;
+        }
+    }
+
+    const size_t input_type_size = ggml_type_size(input_type);
+    const size_t max_chunk_elems = p->buf_bytes / type_size;
+
+    for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
+        const size_t remaining   = (size_t) (ne - chunk_start);
+        const size_t chunk_elems = remaining < max_chunk_elems ? remaining : max_chunk_elems;
+
+        const auto [slot, token, pool_lapped] = ggml_cuda_ar_acquire_slot(p);
+        GGML_UNUSED(pool_lapped);
+        const int prev_token = p->last_chunked_token[slot];
+        p->last_chunked_token[slot] = token;
+        const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
+
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+            cudaStream_t stream = cuda_ctx->stream();
+
+            char * data = static_cast<char *>(tensors[i]->data) + chunk_start * (int64_t) input_type_size;
+
+#define LAUNCH_FLAT(T_dst, T_wire) \
+            do { \
+                ggml_cuda_ar_flat_args<T_wire> args = {}; \
+                for (int r = 0; r < n; ++r) { \
+                    args.wire[r]    = reinterpret_cast<const T_wire *>(p->host_buf[r].dev + (size_t) slot * p->buf_bytes); \
+                    args.arrival[r] = ggml_cuda_ar_arrival_ptr(p, slot, r); \
+                    args.ack_out[r] = ggml_cuda_ar_flat_ack_ptr(p, slot, r, i); \
+                    args.ack_in[r]  = ggml_cuda_ar_flat_ack_ptr(p, slot, i, r); \
+                } \
+                ggml_cuda_ar_flat_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                    reinterpret_cast<const T_dst *>(data), \
+                    reinterpret_cast<T_dst *>(data), \
+                    reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
+                    ggml_cuda_ar_arrival_ptr(p, slot, i), \
+                    args, n, i, active_mask, \
+                    static_cast<int>(chunk_elems), prev_token, token); \
+            } while (0)
+
+            if (use_bf16) {
+                LAUNCH_FLAT(float, nv_bfloat16);
+            } else {
+                switch (input_type) {
+                    case GGML_TYPE_F32:  LAUNCH_FLAT(float,       float);       break;
+                    case GGML_TYPE_F16:  LAUNCH_FLAT(half,        half);        break;
+                    case GGML_TYPE_BF16: LAUNCH_FLAT(nv_bfloat16, nv_bfloat16); break;
+                    default: GGML_ASSERT(false);
+                }
+            }
+#undef LAUNCH_FLAT
+            CUDA_CHECK(cudaGetLastError());
+
+            if (last_chunk) {
+                CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+            }
+        }
+    }
+
+    return true;
+}
+
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -1186,6 +1470,11 @@ bool ggml_cuda_ar_allreduce(
     GGML_ASSERT(p != nullptr);
     const int n = p->n_devices;
     GGML_ASSERT(n == 2 || n == 4);
+
+    // Small n=4 reductions: single flat exchange round.
+    if (n == 4 && ggml_cuda_ar_allreduce_flat(p, backends, tensors)) {
+        return true;
+    }
 
     // Recursive doubling: log2(n) rounds of the pairwise exchange engine.
     // Round r pairs device i with i^(1<<r). After round 0 every device holds
