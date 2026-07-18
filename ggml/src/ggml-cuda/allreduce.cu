@@ -531,6 +531,13 @@ struct ggml_cuda_ar_pipeline {
     // each slot's previous chunked-kernel tenant (0 = none yet).  Only the
     // chunked path touches arrival/ack slots, so only it advances this.
     int last_chunked_token[GGML_CUDA_AR_POOL_SIZE];
+
+    // Serialization chain for switch->root-port P2P transfers (see
+    // GGML_CUDA_AR_ROOT_DEVS in copy_impl_p2p): handle of the event recorded
+    // after the most recent such transfer.  The next one waits on it before
+    // starting, so two of them can never be in flight at once.
+    cudaEvent_t root_pull_chain;
+    bool        root_pull_chain_valid;
 };
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
@@ -883,6 +890,36 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // compute stream. In-place safety (src == dst): rank i's add waits until its
 // peer has finished READING rank i's buffer (ev.cpy[0] fence), so the
 // overwrite can't race the peer's pull.
+//
+// GGML_CUDA_AR_ROOT_DEVS (comma-separated CUDA device ids, post-
+// CUDA_VISIBLE_DEVICES): devices sitting on host root ports rather than
+// behind the PCIe switch.  Two concurrent transfers crossing the switch
+// uplink toward two DIFFERENT root ports collapse to ~0.7 GB/s each on this
+// fabric (root-complex arbitration; a single such transfer runs at full
+// 13.2 GB/s, and same-port concurrency shares fairly).  Any pull whose
+// destination is a root device and whose source is not is therefore chained
+// behind the previous such pull via root_pull_chain, so at most one
+// switch->root transfer is ever in flight.  Unset (default): no chaining,
+// behavior unchanged.
+
+static uint32_t ggml_cuda_ar_root_devs_mask() {
+    static const uint32_t mask = []() {
+        uint32_t m = 0;
+        for (const char * s = getenv("GGML_CUDA_AR_ROOT_DEVS"); s && *s;) {
+            char * end = nullptr;
+            const long id = strtol(s, &end, 10);
+            if (end == s) {
+                break;
+            }
+            if (id >= 0 && id < 32) {
+                m |= 1u << id;
+            }
+            s = *end == ',' ? end + 1 : end;
+        }
+        return m;
+    }();
+    return mask;
+}
 template <typename T_src, typename T_dst>
 static bool ggml_cuda_ar_allreduce_copy_impl_p2p(
         ggml_cuda_ar_pipeline * p,
@@ -919,20 +956,34 @@ static bool ggml_cuda_ar_allreduce_copy_impl_p2p(
     }
 
     // Phase B: every rank pulls its peer's buffer P2P into dev_tmp on the AR stream.
+    const uint32_t root_mask = ggml_cuda_ar_root_devs_mask();
     for (int i = 0; i < (int) p->n_devices; ++i) {
         const int peer = i ^ peer_xor;
         ggml_cuda_set_device(p->devices[i]);
+
+        // Data direction of this pull is peer -> i; chain it if it crosses the
+        // switch uplink into a root port (see GGML_CUDA_AR_ROOT_DEVS above).
+        const bool toward_root =
+            ((root_mask >> p->devices[i])    & 1) != 0 &&
+            ((root_mask >> p->devices[peer]) & 1) == 0;
 
         if (p->dev_tmp_kernel_done_valid) {
             CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i]));
         }
         CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].app));
+        if (toward_root && p->root_pull_chain_valid) {
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->root_pull_chain));
+        }
         CUDA_CHECK(cudaMemcpyPeerAsync(
             p->dev_tmp[i], p->devices[i],
             src_buf[peer], p->devices[peer],
             nbytes, p->streams[i]));
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[0], p->streams[i])); // "read of peer done"
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d,    p->streams[i])); // my copy-in done
+        if (toward_root) {
+            p->root_pull_chain       = p->ev_pool[i][slot].cpy[0];
+            p->root_pull_chain_valid = true;
+        }
     }
 
     // Phase C: adds on the compute streams, fenced on (my copy-in) AND (peer's read of me).
