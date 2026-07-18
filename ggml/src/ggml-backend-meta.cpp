@@ -2374,7 +2374,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 }
 
 
+// MCPY-DIAG: counters for the pipeline-overlap machinery. Printed every 64
+// async-copy calls and on the first few failures, to establish whether the
+// sched routes inter-stage copies through the async path at all.
+static int mcpy_calls = 0, mcpy_ok = 0, mcpy_fail[5] = {0,0,0,0,0};
+static int mev_record = 0, mev_wait = 0;
+
 static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    mev_record++;
     ggml_backend_meta_context * meta_ctx = (ggml_backend_meta_context *) backend->context;
     auto * evs = (std::vector<ggml_backend_event_t> *) event->context;
     GGML_ASSERT(evs->size() == meta_ctx->backend_configs.size());
@@ -2384,6 +2391,7 @@ static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_
 }
 
 static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    mev_wait++;
     ggml_backend_meta_context * meta_ctx = (ggml_backend_meta_context *) backend->context;
     auto * evs = (std::vector<ggml_backend_event_t> *) event->context;
     // Cross-stage wait: every member stream of this meta backend waits on every
@@ -2402,27 +2410,39 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     // fallback host-synchronizes BOTH stages on every split boundary, which
     // serializes the whole pipeline. Delegate member-wise to the simple
     // backends' async copies (CUDA handles cross-device ordering + peer DMA).
+    mcpy_calls++;
+    static const bool mcpy_diag = getenv("MCPY_DIAG") != nullptr;
+    if (mcpy_diag && mcpy_calls % 64 == 0) {
+        fprintf(stderr, "MCPY-DIAG calls=%d ok=%d fail[nonmeta,n,buf,axis,member]=%d,%d,%d,%d,%d ev_rec=%d ev_wait=%d\n",
+                mcpy_calls, mcpy_ok, mcpy_fail[0], mcpy_fail[1], mcpy_fail[2], mcpy_fail[3], mcpy_fail[4],
+                mev_record, mev_wait);
+    }
     if (!ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst)) {
+        mcpy_fail[0]++;
         return false;
     }
     const size_t n_src = ggml_backend_meta_n_backends(backend_src);
     const size_t n_dst = ggml_backend_meta_n_backends(backend_dst);
     if (n_src != n_dst) {
+        mcpy_fail[1]++;
         return false;
     }
     if (!ggml_backend_buffer_is_meta(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer)) {
+        mcpy_fail[2]++;
         return false;
     }
     // Only mirror-to-mirror copies are member-wise correct; anything else
     // falls back to the safe synchronous gather path.
     if (ggml_backend_meta_get_split_state(src, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
         ggml_backend_meta_get_split_state(dst, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        mcpy_fail[3]++;
         return false;
     }
     for (size_t i = 0; i < n_src; i++) {
         ggml_tensor * s = ggml_backend_meta_buffer_simple_tensor(const_cast<ggml_tensor *>(src), i);
         ggml_tensor * d = ggml_backend_meta_buffer_simple_tensor(dst, i);
         if (s == nullptr || d == nullptr) {
+            mcpy_fail[4]++;
             return false;
         }
         ggml_backend_tensor_copy_async(
@@ -2430,6 +2450,7 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             ggml_backend_meta_simple_backend(backend_dst, i),
             s, d);
     }
+    mcpy_ok++;
     return true;
 }
 
