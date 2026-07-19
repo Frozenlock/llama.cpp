@@ -88,6 +88,12 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // unmasked nextn double-buffering (see embd_nextn below): sequence number
+    // of the next decode, and event-synchronized access to one of the two most
+    // recent batches' rows without draining the scheduler
+    uint64_t embeddings_nextn_seq() const;
+    float *  get_embeddings_nextn_batch(uint64_t seq);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -298,7 +304,14 @@ private:
     // hidden state required by the nextn layers (2-dimensional array: [n_outputs][n_embd])
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
+    // in unmasked mode the buffer holds TWO n_batch-row slots: decode()
+    // alternates the destination slot per call and records ev_nextn[slot], so
+    // the MTP hook can consume batch N-1's rows (event wait only) while batch
+    // N keeps the pipeline fed instead of draining the whole scheduler
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    uint64_t             nextn_seq = 0; // decodes that extracted unmasked nextn rows
+    ggml_backend_event_t ev_nextn[2] = {nullptr, nullptr};
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

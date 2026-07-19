@@ -107,6 +107,16 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Unmasked-mode batch access without draining the scheduler (used by the MTP
+// hook to overlap the draft catch-up with the next main batch).
+// llama_embeddings_nextn_seq returns the number of decodes that extracted
+// unmasked nextn rows; the batch just decoded has seq = count - 1.
+// llama_get_embeddings_nextn_batch waits only for that batch's D2H copies
+// (backend event) and returns its dense per-position rows. Only the two most
+// recent batches are resident.
+LLAMA_API uint64_t llama_embeddings_nextn_seq(const struct llama_context * ctx);
+LLAMA_API float *  llama_get_embeddings_nextn_batch(struct llama_context * ctx, uint64_t seq);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

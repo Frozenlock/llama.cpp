@@ -484,6 +484,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    for (auto & ev : ev_nextn) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -940,7 +946,32 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
 
+    if (!cparams.embeddings_nextn_masked && embd_nextn.data && nextn_seq > 0) {
+        // unmasked: return the slot of the most recently submitted batch
+        const size_t slot_size = (size_t) cparams.n_batch * model.hparams.n_embd_out();
+        return embd_nextn.data + ((nextn_seq - 1) & 1) * slot_size;
+    }
+
     return embd_nextn.data;
+}
+
+uint64_t llama_context::embeddings_nextn_seq() const {
+    return nextn_seq;
+}
+
+float * llama_context::get_embeddings_nextn_batch(uint64_t seq) {
+    GGML_ASSERT(!cparams.embeddings_nextn_masked && embd_nextn.data != nullptr);
+    // only the two most recent batches are still resident
+    GGML_ASSERT(seq < nextn_seq && seq + 2 >= nextn_seq);
+
+    const int slot = seq & 1;
+    if (ev_nextn[slot]) {
+        // wait for this batch's D2H copies only - later batches keep running
+        ggml_backend_event_synchronize(ev_nextn[slot]);
+    }
+
+    const size_t slot_size = (size_t) cparams.n_batch * model.hparams.n_embd_out();
+    return embd_nextn.data + (size_t) slot * slot_size;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
@@ -954,11 +985,15 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
         const uint32_t n_embd = model.hparams.n_embd_out();
 
         if (!cparams.embeddings_nextn_masked) {
-            // unmasked: nextn rows are stored densely, indexed by raw token position.
-            if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size) {
-                throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / n_embd));
+            // unmasked: nextn rows are stored densely, indexed by raw token
+            // position, in the slot of the most recently submitted batch
+            const size_t slot_size = (size_t) cparams.n_batch * n_embd;
+            if (i < 0 || (size_t)(i + 1) * n_embd > slot_size) {
+                throw std::runtime_error(format("out of range [0, %zu)", slot_size / n_embd));
             }
-            return embd_nextn.data + (size_t) i * n_embd;
+            float * base = nextn_seq > 0 ? embd_nextn.data + ((nextn_seq - 1) & 1) * slot_size
+                                         : embd_nextn.data;
+            return base + (size_t) i * n_embd;
         }
 
         const int64_t j = output_resolve_row(i);
@@ -1166,6 +1201,13 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // unmasked nextn keeps the last layer full-width, growing the worst-case
+    // graph beyond the init-time reservation. Without re-reserving, every
+    // prefill ubatch overflows the compute buffers and triggers a gallocr
+    // re-reserve (cudaFree/cudaMalloc = device-wide sync) that serializes the
+    // PP pipeline: TP2 prefill 447 -> 274 t/s. Measured 2026-07-18.
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -1325,11 +1367,18 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // LLAMA_DECODE_TIMING >= 3: per-phase breakdown of ubatch processing
+    static const int pu_timing = [](){ const char * e = getenv("LLAMA_DECODE_TIMING"); return e ? atoi(e) : 0; }();
+    const bool pu_log = pu_timing >= 3 && ubatch.n_tokens > 64;
+    const int64_t pu0 = pu_log ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    const int64_t pu1 = pu_log ? ggml_time_us() : 0;
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1338,8 +1387,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    bool    pu_reused = false;
+    int64_t pu2 = pu1, pu3 = pu1, pu4 = pu1;
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+
+        pu_reused = true;
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
@@ -1347,6 +1401,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
+
+        if (pu_log) { pu2 = pu3 = pu4 = ggml_time_us(); } // reuse+sync lumped
 
         n_reused++;
     } else {
@@ -1367,11 +1423,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        pu3 = pu_log ? ggml_time_us() : 0;
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        pu4 = pu_log ? ggml_time_us() : 0;
     }
 
     // set the input data for the input tensors
@@ -1384,11 +1444,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t pu5 = pu_log ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (pu_log) {
+        const int64_t pu6 = ggml_time_us();
+        fprintf(stderr, "PU n=%d reuse=%d apply=%.1f build=%.1f alloc=%.1f inputs=%.1f compute=%.1f total=%.1fms\n",
+                (int) ubatch.n_tokens, pu_reused ? 1 : 0,
+                (pu1-pu0)/1000.0, (pu3-pu2)/1000.0, (pu4-pu3)/1000.0, (pu5-pu4)/1000.0, (pu6-pu5)/1000.0,
+                (pu6-pu0)/1000.0);
+        fflush(stderr);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1842,8 +1913,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // backend that received this batch's unmasked nextn D2H copies; an event
+    // recorded on it after the loop marks when those copies are complete
+    ggml_backend_t backend_nextn = nullptr;
+
+    // LLAMA_DECODE_TIMING: 1 = per-batch host-side breakdown (submit/extract),
+    // 2 = also sync after each ubatch to attribute GPU completion (serializes!)
+    static const int decode_timing = [](){ const char * e = getenv("LLAMA_DECODE_TIMING"); return e ? atoi(e) : 0; }();
+    if (decode_timing >= 9) {
+        fprintf(stderr, "DT_PROBE decode entered, n_tokens_all=%d\n", (int) n_tokens_all);
+    }
+    int64_t dt_proc = 0, dt_extr = 0, dt_gpu = 0;
+    int     dt_n_ub = 0;
+    const int64_t dt_batch0 = decode_timing ? ggml_time_us() : 0;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        const int64_t dt0 = decode_timing ? ggml_time_us() : 0;
 
         // count the outputs in this ubatch
         {
@@ -1900,6 +1987,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        const int64_t dt1 = decode_timing ? ggml_time_us() : 0;
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
@@ -1993,15 +2082,50 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            // LLAMA_MTP_NO_EXTRACT: perf-bisect switch - graph unchanged, but
+            // the per-ubatch D2H copy of nextn rows is skipped
+            static const bool no_extract = getenv("LLAMA_MTP_NO_EXTRACT") != nullptr;
+
+            if (!no_extract && embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                // unmasked: write into this batch's slot of the double buffer
+                const size_t slot_size = (size_t) cparams.n_batch * n_embd;
+                float * base = masked ? embd_nextn.data
+                                      : embd_nextn.data + (nextn_seq & 1) * slot_size;
+                float * embd_nextn_out = base + offset*n_embd;
+
+                if (masked) {
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                } else {
+                    GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) slot_size);
+                }
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+
+                if (!masked) {
+                    backend_nextn = backend_h;
+                }
+            }
+        }
+
+        if (decode_timing) {
+            const int64_t dt2 = ggml_time_us();
+            dt_proc += dt1 - dt0; // graph build + sched alloc + compute submit
+            dt_extr += dt2 - dt1; // output copy enqueues (logits/embd/nextn)
+            dt_n_ub++;
+            // == 2 only: level 3+ wants normal (non-serialized) behavior
+            if (decode_timing == 2) {
+                ggml_backend_sched_synchronize(sched.get());
+                const int64_t dt3 = ggml_time_us();
+                dt_gpu += dt3 - dt2;
+                if (n_tokens_all > 64) {
+                    fprintf(stderr, "DT_UB i=%d n=%d proc=%.1fms extract=%.1fms gpu=%.1fms\n",
+                            dt_n_ub, (int) ubatch.n_tokens, (dt1-dt0)/1000.0, (dt2-dt1)/1000.0, (dt3-dt2)/1000.0);
+                    fflush(stderr);
+                }
             }
         }
 
@@ -2021,6 +2145,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (decode_timing && n_tokens_all > 64) {
+        const int64_t dt_wall = ggml_time_us() - dt_batch0;
+        // raw stderr like TPTIMING - the llama log path proved unreliable here
+        fprintf(stderr, "DECODE_TIMING n=%d ub=%d wall=%.1fms proc=%.1fms extract=%.1fms gpu_sync=%.1fms\n",
+                (int) n_tokens_all, dt_n_ub, dt_wall/1000.0, dt_proc/1000.0, dt_extr/1000.0, dt_gpu/1000.0);
+        fflush(stderr);
+    }
+
+    // unmasked nextn: mark this batch's copies complete and advance the slot
+    if (backend_nextn != nullptr) {
+        const int slot = nextn_seq & 1;
+        if (!ev_nextn[slot]) {
+            ev_nextn[slot] = ggml_backend_event_new(ggml_backend_get_device(backend_nextn));
+            GGML_ASSERT(ev_nextn[slot] != nullptr);
+        }
+        ggml_backend_event_record(ev_nextn[slot], backend_nextn);
+        nextn_seq++;
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2114,7 +2257,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        // two slots so the MTP hook can read batch N-1 while N is in flight.
+        embd_nextn.size = (size_t) 2 * n_embd_out * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2292,7 +2436,9 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        // unmasked nextn rows are stored densely by token position (not by
+        // output row), so output reordering does not apply to them
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
             }
@@ -3746,6 +3892,16 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();
+}
+
+uint64_t llama_embeddings_nextn_seq(const llama_context * ctx) {
+    // note: no synchronize - the counter is host-side, advanced at submit time
+    return ctx->embeddings_nextn_seq();
+}
+
+float * llama_get_embeddings_nextn_batch(llama_context * ctx, uint64_t seq) {
+    // note: no synchronize - waits only for the requested batch's copy event
+    return ctx->get_embeddings_nextn_batch(seq);
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {

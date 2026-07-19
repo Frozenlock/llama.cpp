@@ -1237,6 +1237,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // Deferred (lag-1) prefill processing. Consuming a batch's nextn rows
+    // requires waiting for its compute; doing that inside process() right
+    // after the batch was submitted stalls the host while the PP pipeline
+    // drains. Instead each process() call stashes its batch and completes the
+    // PREVIOUS one, whose rows are ready (or nearly so) because the current
+    // batch was already enqueued behind it - the pipeline stays fed and the
+    // draft catch-up decode overlaps the next main batch instead of running
+    // in the drain bubble. Flushed in begin()/draft()/accept().
+    struct {
+        bool                      valid = false;
+        uint64_t                  seq_no = 0;  // ctx_tgt nextn batch sequence number
+        std::vector<llama_token>  tokens;
+        std::vector<llama_pos>    pos;
+        std::vector<llama_seq_id> seqs;
+    } job;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1337,6 +1353,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (!flush_pending()) {
+            SPC_ERR("%s", "deferred MTP batch failed in begin()\n");
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1364,36 +1384,85 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        const int32_t n_tokens = batch_in.n_tokens;
+        // complete the previous batch first: its rows are ready (or nearly so)
+        // because the batch just submitted is queued behind it on the GPUs
+        const bool ok = flush_pending();
+
+        const uint64_t seq_cnt = llama_embeddings_nextn_seq(params.ctx_tgt);
+        if (seq_cnt == 0) {
+            SPC_WRN("%s", "target decode extracted no nextn rows - skipping MTP mirror for this batch\n");
+            return ok;
+        }
+
+        job.valid  = true;
+        job.seq_no = seq_cnt - 1;
+        job.tokens.assign(batch_in.token, batch_in.token + batch_in.n_tokens);
+        job.pos.assign(batch_in.pos, batch_in.pos + batch_in.n_tokens);
+        job.seqs.resize(batch_in.n_tokens);
+        for (int32_t k = 0; k < batch_in.n_tokens; ++k) {
+            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+            job.seqs[k] = batch_in.seq_id[k][0];
+        }
+
+        return ok;
+    }
+
+    bool flush_pending() {
+        if (!job.valid) {
+            return true;
+        }
+        job.valid = false;
+
+        const int32_t n_tokens = (int32_t) job.tokens.size();
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
 
         // remember the frist and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
 
-        for (int k = 0; k < n_tokens; ++k) {
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
-
-                if (batch_in.seq_id[k][0] == seq_id) {
-                    i_batch_end[seq_id] = k;
-                    if (i_batch_beg[seq_id] < 0) {
-                        i_batch_beg[seq_id] = k;
-                    }
-                }
+        for (int32_t k = 0; k < n_tokens; ++k) {
+            const llama_seq_id seq_id = job.seqs[k];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                continue;
+            }
+            i_batch_end[seq_id] = k;
+            if (i_batch_beg[seq_id] < 0) {
+                i_batch_beg[seq_id] = k;
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
-
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const bool timing = n_tokens > 64; // prefill batches only
+        const int64_t t0 = ggml_time_us();
+
+        // dense per-position rows of the stashed batch; waits only for that
+        // batch's copy event, not for whatever was submitted after it
+        const float * h_all = llama_get_embeddings_nextn_batch(ctx_tgt, job.seq_no);
+
+        const int64_t t_ev = ggml_time_us();
+
+        int64_t t_sync = t_ev;
+        int64_t t_dec  = t_ev;
+
+        // LLAMA_MTP_NO_CATCHUP: perf-bisect switch - skips the draft catch-up
+        // decode entirely (drafting degrades; prefill speed isolates its cost)
+        static const bool no_catchup = getenv("LLAMA_MTP_NO_CATCHUP") != nullptr;
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !no_catchup) {
+            // the previous catch-up decode may still be in flight (it overlaps
+            // the main pipeline now); reused draft graphs write inputs in place
+            llama_synchronize(ctx_dft);
+
+            t_sync = ggml_time_us();
+
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+            for (int32_t k = 0; k < n_tokens; ++k) {
+                common_batch_add(batch, job.tokens[k], job.pos[k], { job.seqs[k] }, 0);
             }
 
             // shift the tgt embeddings to the right by one position
@@ -1401,22 +1470,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
+            std::memcpy(batch.embd + (size_t) 1 * n_embd, h_all, row_bytes * (n_tokens-1));
 
             // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                std::memcpy(batch.embd + (size_t) i_batch_beg[seq_id] * n_embd, pending_h[seq_id].data(), row_bytes);
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1429,7 +1491,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         if (i_batch_beg[seq_id] < 0) {
                             continue;
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                        llama_memory_seq_rm(mem_dft, seq_id, job.pos[i_batch_beg[seq_id]], -1);
                     }
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
@@ -1437,7 +1499,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t rc = llama_decode(ctx_dft, batch);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.pos[0]);
+                            head, (int) rc, (int) job.pos[0]);
                     ok = false;
                     break;
                 }
@@ -1446,9 +1508,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+
+            t_dec = ggml_time_us();
+
             if (!ok) {
                 return false;
             }
+        }
+
+        if (timing) {
+            // measure the draft decode's GPU completion, not just submission
+            llama_synchronize(ctx_dft);
+            const int64_t t_gpu = ggml_time_us();
+            SPC_INF("mtp flush: n=%d ev_wait=%.1fms dft_sync=%.1fms dft_dec=%.1fms dft_gpu=%.1fms\n",
+                    n_tokens, (t_ev - t0)/1000.0, (t_sync - t_ev)/1000.0, (t_dec - t_sync)/1000.0,
+                    (t_gpu - t_dec)/1000.0);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1460,10 +1534,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
+            std::memcpy(verify_h[seq_id].data(),
+                    h_all + (size_t) i_batch_beg[seq_id] * n_embd, row_bytes * n_rows);
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
@@ -1473,6 +1545,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        // drafting depends on pending_h/ctx_dft KV from the last target batch
+        if (!flush_pending()) {
+            SPC_ERR("%s", "deferred MTP batch failed in draft()\n");
+        }
+
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1624,6 +1701,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        // verify_h for the batch just decoded may still be in the deferred job
+        if (!flush_pending()) {
+            SPC_ERR("%s", "deferred MTP batch failed in accept()\n");
+        }
+
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
