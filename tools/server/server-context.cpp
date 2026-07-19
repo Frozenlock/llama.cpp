@@ -1652,6 +1652,15 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
+                // pool-pressure eviction: stash the state in the RAM prompt cache
+                // (dedup inside prompt_save makes this free if already cached) so the
+                // conversation restores instead of re-prefilling
+                if (prompt_cache) {
+                    if (slot.prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
+                    }
+                }
+
                 slot.prompt_clear();
 
                 res = true;
@@ -2370,6 +2379,37 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    // LLAMA_POOL_ADMIT_RESERVE=N: with a unified KV pool, admitting a
+                    // prompt that cannot fit alongside the active contexts ends with
+                    // decode() erroring ALL active slots once the pool runs dry. Defer
+                    // the incoming task instead until a running one completes. N is
+                    // headroom kept for generation growth of the active slots.
+                    // Never defers when no slot is active (truncation handles oversize).
+                    {
+                        static const int32_t pool_admit_reserve = [] {
+                            const char * s = getenv("LLAMA_POOL_ADMIT_RESERVE");
+                            return s ? atoi(s) : -1; // -1 = disabled
+                        }();
+                        if (pool_admit_reserve >= 0 && params_base.kv_unified &&
+                                task.type == SERVER_TASK_TYPE_COMPLETION) {
+                            int64_t n_active = 0;
+                            for (const auto & s : slots) {
+                                if (s.is_processing()) {
+                                    n_active += s.prompt.n_tokens();
+                                }
+                            }
+                            const int64_t n_pool = llama_n_ctx(ctx_tgt);
+                            if (n_active > 0 &&
+                                    n_active + (int64_t) task.n_tokens() + pool_admit_reserve > n_pool) {
+                                SRV_WRN("pool admission: deferring task %d (incoming %d + active %d + reserve %d > pool %d)\n",
+                                        id_task, (int) task.n_tokens(), (int) n_active,
+                                        (int) pool_admit_reserve, (int) n_pool);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                        }
                     }
 
                     if (task.is_parent()) {

@@ -1416,6 +1416,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // LLAMA_LOG is unreliable in this fork's server; dump the final layer->device
+    // map on stderr so relocation planning doesn't need a diagnostic relaunch.
+    {
+        fprintf(stderr, "LAYERMAP:");
+        int run_start = 0;
+        for (int il = 1; il <= n_layer_all; ++il) {
+            if (il == n_layer_all || pimpl->dev_layer[il].dev != pimpl->dev_layer[run_start].dev) {
+                const char * name = pimpl->dev_layer[run_start].dev
+                    ? ggml_backend_dev_name(pimpl->dev_layer[run_start].dev) : "CPU";
+                if (run_start == il - 1) {
+                    fprintf(stderr, " %d->%s", run_start, name);
+                } else {
+                    fprintf(stderr, " %d-%d->%s", run_start, il - 1, name);
+                }
+                run_start = il;
+            }
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
