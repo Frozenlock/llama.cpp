@@ -2322,8 +2322,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     static const bool tp_spike_dump   = getenv("TP_SPIKE_DUMP") != nullptr;
     static const bool tp_spike_timing = getenv("TP_SPIKE_TIMING") != nullptr;
+    // TP_SUBMIT_TIMING: like TP_SPIKE_TIMING but WITHOUT the end sync - shows
+    // host-side launch/allreduce blocking per compute call at normal speed
+    static const bool tp_submit_timing = getenv("TP_SUBMIT_TIMING") != nullptr;
+    const bool tp_time = tp_spike_timing || tp_submit_timing;
     int64_t t_launch_us = 0, t_reduce_us = 0, t_start_us = 0;
-    if (tp_spike_timing) {
+    if (tp_time) {
         t_start_us = ggml_time_us();
     }
 
@@ -2431,7 +2435,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     for (int pass = 0; ; pass++) {
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        const int64_t t0 = tp_spike_timing ? ggml_time_us() : 0;
+        const int64_t t0 = tp_time ? ggml_time_us() : 0;
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -2468,7 +2472,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        const int64_t t1 = tp_spike_timing ? ggml_time_us() : 0;
+        const int64_t t1 = tp_time ? ggml_time_us() : 0;
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             bool backend_allreduce_success = false;
@@ -2490,7 +2494,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
-        if (tp_spike_timing) {
+        if (tp_time) {
             const int64_t t2 = ggml_time_us();
             t_launch_us += t1 - t0;
             t_reduce_us += t2 - t1;
@@ -2532,6 +2536,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_ASSERT(pass == 0);
         // fall through: loop again, executing eagerly this time
     }
+    }
+
+    if (tp_submit_timing) {
+        // no sync: reports host-side blocking inside this compute call only
+        const int64_t t_host = ggml_time_us() - t_start_us;
+        if (t_host > 100000) {
+            fprintf(stderr, "TPSUBMIT host=%.1fms launch=%.1fms reduce=%.1fms subgraphs=%zu\n",
+                    t_host/1000.0, t_launch_us/1000.0, t_reduce_us/1000.0, backend_ctx->n_subgraphs);
+            fflush(stderr);
+        }
     }
 
     if (tp_spike_timing) {

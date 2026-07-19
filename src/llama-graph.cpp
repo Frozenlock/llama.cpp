@@ -1238,7 +1238,12 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         ggml_set_output(t_embd_pooled);
     }
     if (t_h_nextn != nullptr) {
-        ggml_set_output(t_h_nextn);
+        // LLAMA_MTP_NO_OUTPUT_FLAG: perf-bisect switch - skip marking the
+        // nextn tensor as a graph output (extraction may read stale memory)
+        static const bool no_out_flag = getenv("LLAMA_MTP_NO_OUTPUT_FLAG") != nullptr;
+        if (!no_out_flag) {
+            ggml_set_output(t_h_nextn);
+        }
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
