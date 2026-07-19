@@ -1385,6 +1385,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
 
+    // LLAMA_LAYER_DEVICE="il:dev[,il:dev...]": force specific layers onto
+    // specific device indices (TP mode: pair index in visible-pair order).
+    // The layer's weights AND its KV shards follow. Used to relocate layers
+    // whose unsplit caches crowd a pinch device (GLM-5.2: cache_k_l40,
+    // 1134 MiB on the 4th pair at 72K, blocks every context increase).
+    if (const char * env = getenv("LLAMA_LAYER_DEVICE")) {
+        std::string ov(env);
+        size_t pos = 0;
+        while (pos < ov.size()) {
+            const size_t colon = ov.find(':', pos);
+            if (colon == std::string::npos) {
+                break;
+            }
+            size_t comma = ov.find(',', colon);
+            if (comma == std::string::npos) {
+                comma = ov.size();
+            }
+            const int il = atoi(ov.substr(pos, colon - pos).c_str());
+            const int di = atoi(ov.substr(colon + 1, comma - colon - 1).c_str());
+            if (il >= 0 && il < n_layer_all && di >= 0 && di < (int) n_devices()) {
+                auto * dev = devices.at(di).dev;
+                pimpl->dev_layer[il] = {dev, &pimpl->gpu_buft_list.at(dev)};
+                LLAMA_LOG_INFO("load_tensors: layer %3d OVERRIDDEN to device %s (LLAMA_LAYER_DEVICE)\n",
+                        il, ggml_backend_dev_name(dev));
+            } else {
+                LLAMA_LOG_WARN("load_tensors: ignoring invalid LLAMA_LAYER_DEVICE entry %d:%d\n", il, di);
+            }
+            pos = comma + 1;
+        }
+    }
+
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
