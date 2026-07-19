@@ -1453,6 +1453,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared && !no_catchup) {
+            // the server may have trimmed or rolled back the caches since this
+            // job was stashed (context shift on a full context, truncation,
+            // LCP cache reuse between tasks). Decoding stale positions fails
+            // the consecutive-position check and poisons the slot. Drop the
+            // job instead: its positions belong to pre-trim state, and the
+            // server's own trim logic realigns the draft cache from the next
+            // batch onward.
+            auto * mem_val = llama_get_memory(ctx_dft);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                const llama_pos pos_beg = job.pos[i_batch_beg[seq_id]];
+                const llama_pos pos_max = llama_memory_seq_pos_max(mem_val, seq_id);
+                if (pos_beg != pos_max + 1) {
+                    SPC_WRN("dropping stale deferred MTP batch: seq=%d pos_beg=%d != kv_pos_max+1=%d "
+                            "(cache trimmed since stash)\n",
+                            (int) seq_id, (int) pos_beg, (int) pos_max + 1);
+                    return true;
+                }
+            }
+
             // the previous catch-up decode may still be in flight (it overlaps
             // the main pipeline now); reused draft graphs write inputs in place
             llama_synchronize(ctx_dft);
