@@ -287,6 +287,11 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        // LLAMA_LOG is swallowed in this fork's server; mirror to stderr for
+        // context-budget planning (see journal Part 21 addendum).
+        fprintf(stderr, "KVBUF: %-14s %8.2f MiB\n", ggml_backend_buffer_name(buf),
+                ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        fflush(stderr);
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
@@ -300,6 +305,19 @@ llama_kv_cache::llama_kv_cache(
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+
+        // per-layer KV footprint + bytes/token, so the dense (unsplit) layers are
+        // identifiable and max-context arithmetic is exact rather than estimated.
+        fprintf(stderr, "KVTOTAL: %.2f MiB over %d layers, %u cells\n",
+                (memory_size_k + memory_size_v) / (1024.0 * 1024.0), (int) layers.size(), kv_size);
+        for (const auto & lay : layers) {
+            const size_t sz = (lay.k ? ggml_nbytes(lay.k) : 0) + (lay.v ? ggml_nbytes(lay.v) : 0);
+            fprintf(stderr, "KVLAYER: il=%3u  %8.2f MiB  %6.2f KiB/token  buf=%s\n",
+                    lay.il, sz / (1024.0 * 1024.0),
+                    kv_size ? (double) sz / kv_size / 1024.0 : 0.0,
+                    (lay.k && lay.k->buffer) ? ggml_backend_buffer_name(lay.k->buffer) : "?");
+        }
+        fflush(stderr);
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
