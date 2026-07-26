@@ -1532,6 +1532,19 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                // Pinned slots bypass the LCP/LRU selection that restores a
+                // matching prefix from the RAM prompt cache, so a pinned request
+                // that lands on a slot without the prefix cold-prefills the whole
+                // thing. If this slot's own resident cache does not already cover
+                // the prompt, opt into the same restore path (prompt_save +
+                // prompt_load below). When the slot already holds the prefix,
+                // f_have stays high and fast in-place reuse is preserved.
+                const size_t n_tok = task.tokens.size();
+                const size_t lcp   = ret->prompt.tokens.get_common_prefix(task.tokens);
+                const float  f_have = n_tok ? (float) lcp / (float) n_tok : 1.0f;
+                if (f_have < 0.5f) {
+                    update_cache = true;
+                }
             }
         }
 
