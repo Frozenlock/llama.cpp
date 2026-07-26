@@ -3208,6 +3208,59 @@ private:
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
 
+                                // cross-slot prefix reuse (LLAMA_CROSS_SLOT_PREFIX, default off).
+                                // If another slot already holds a LONGER identical prefix of this
+                                // prompt, adopt its KV cells via seq_cp (metadata-only under
+                                // --kv-unified) instead of cold-prefilling. Copies BOTH the target
+                                // and the draft (spec) contexts: a target/draft position desync is
+                                // exactly what crashed the server before (commit 1c9d9c3ba), so the
+                                // donation is only taken when the donor demonstrably holds [0,n_donor)
+                                // in both. All-or-nothing: on any doubt we fall back to a normal
+                                // (correct) cold prefill.
+                                static const bool cross_slot_prefix = [] {
+                                    const char * s = getenv("LLAMA_CROSS_SLOT_PREFIX");
+                                    return s ? atoi(s) != 0 : false;
+                                }();
+                                if (cross_slot_prefix && params_base.kv_unified &&
+                                        slot.alora_invocation_start <= 0 &&
+                                        !input_tokens.has_mtmd && !input_tokens.has_media()) {
+                                    const server_slot * donor = nullptr;
+                                    size_t n_donor = (size_t) n_past;
+                                    for (const server_slot & other : slots) {
+                                        if (other.id == slot.id)          continue;
+                                        if (other.prompt.n_tokens() == 0) continue;
+                                        if (other.prompt.tokens.has_mtmd || other.prompt.tokens.has_media()) continue;
+                                        const size_t lc = std::min<size_t>((size_t) other.prompt.n_tokens(),
+                                                              other.prompt.tokens.get_common_prefix(input_tokens));
+                                        if (lc > n_donor) { n_donor = lc; donor = &other; }
+                                    }
+                                    if (donor != nullptr) {
+                                        auto * mem_tgt = llama_get_memory(ctx_tgt);
+                                        auto * mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+                                        // adopt only if the donor truly holds [0, n_donor) in BOTH contexts
+                                        const bool tgt_ok = llama_memory_seq_pos_max(mem_tgt, donor->id) >= (llama_pos) n_donor - 1;
+                                        const bool dft_ok = !mem_dft || llama_memory_seq_pos_max(mem_dft, donor->id) >= (llama_pos) n_donor - 1;
+                                        if (tgt_ok && dft_ok) {
+                                            llama_memory_seq_rm(mem_tgt, slot.id, 0, -1);
+                                            llama_memory_seq_cp(mem_tgt, donor->id, slot.id, 0, (llama_pos) n_donor);
+                                            if (mem_dft) {
+                                                llama_memory_seq_rm(mem_dft, slot.id, 0, -1);
+                                                llama_memory_seq_cp(mem_dft, donor->id, slot.id, 0, (llama_pos) n_donor);
+                                            }
+                                            // rebuild this slot's token record to match the copied cells
+                                            // (invariant: cache tokens must equal the KV contents)
+                                            const llama_tokens & dtoks = donor->prompt.tokens.get_tokens();
+                                            const llama_tokens prefix(dtoks.begin(), dtoks.begin() + n_donor);
+                                            slot.prompt.tokens.clear();
+                                            slot.prompt.tokens.insert(prefix);
+                                            slot.prompt.checkpoints.clear();
+                                            n_past = (int) n_donor;
+                                            SLT_INF(slot, "cross-slot prefix reuse: adopted %zu-token prefix from slot %d\n",
+                                                    n_donor, donor->id);
+                                        }
+                                    }
+                                }
+
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
