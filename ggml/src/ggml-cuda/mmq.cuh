@@ -236,7 +236,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
-        return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+        ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+        c.stream_k = false; // [FUSE-EXP] drop ~10.7k stream_k_fixup launches (prefill is launch-count bound)
+        return c;
     }
     return ggml_cuda_mmq_get_config_pascal(type, J, fallback);
 }
@@ -254,7 +256,7 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #ifdef BLACKWELL_MMA_AVAILABLE
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+    { ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config_ampere(type, J, fallback); c.stream_k = false; return c; } // [FUSE-EXP]
 #else
     return ggml_cuda_mmq_get_config_pascal(type, J, fallback);
 #endif // BLACKWELL_MMA_AVAILABLE
