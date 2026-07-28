@@ -824,6 +824,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_im
     };
 
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Position-sharded KV cache (LLAMA_KV_SHARD): src[0]=values (mirrored),
+        // src[1]=indices (mirrored), src[2]=destination cache split on the row
+        // axis. Each member executes the same set_rows with per-member-rebased
+        // indices; the CUDA kernel skips rows outside [0, n_rows_dst) so
+        // out-of-shard writes are no-ops. Result inherits the cache's state.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            return src_ss[2];
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                src_ss[1].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                !split_states_equal(src_ss[0], src_ss[2])) {
+            fprintf(stderr, "META set_rows mismatch: node=%s dst=%s(axis %d) idx=%s(axis %d) val=%s(axis %d)\n",
+                tensor->name, tensor->src[0]->name, (int) src_ss[0].axis,
+                tensor->src[1]->name, (int) src_ss[1].axis,
+                tensor->src[2]->name, (int) src_ss[2].axis);
+        }
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));

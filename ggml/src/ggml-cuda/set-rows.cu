@@ -13,6 +13,7 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const int64_t ne11,
                                         const int64_t ne12,
                                         const int64_t ne13,
+                                        const int64_t n_rows_dst,
                                         const int64_t s01,
                                         const int64_t s02,
                                         const int64_t s03,
@@ -55,6 +56,10 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
 
     ggml_cuda_pdl_sync();
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0 || dst_row >= n_rows_dst) {
+        // out-of-shard row (position-sharded KV cache): this member skips it
+        return;
+    }
 
     const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_type * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_type);
@@ -76,6 +81,7 @@ static void set_rows_cuda_quant(
         const float * src0_d, const idx_t * src1_d, block_type * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const int64_t n_rows_dst,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
@@ -105,7 +111,7 @@ static void set_rows_cuda_quant(
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
         k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
+            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, n_rows_dst, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd);
     }
 }
@@ -119,6 +125,7 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
                                   const int64_t ne11,
                                   const int64_t ne12,
                                   const int64_t ne13,
+                                  const int64_t n_rows_dst,
                                   const int64_t s01,
                                   const int64_t s02,
                                   const int64_t s03,
@@ -163,6 +170,10 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
 
     ggml_cuda_pdl_sync();
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    if (dst_row < 0 || dst_row >= n_rows_dst) {
+        // out-of-shard row (position-sharded KV cache): this member skips it
+        return;
+    }
     ggml_cuda_pdl_lc();
 
     const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
@@ -181,6 +192,7 @@ static void set_rows_cuda(
         const src_t * src0_d, const idx_t * src1_d, dst_t * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const int64_t n_rows_dst,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
@@ -211,7 +223,7 @@ static void set_rows_cuda(
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_size, block_size, 0, stream);
         ggml_cuda_kernel_launch(k_set_rows<src_t, idx_t, dst_t>, launch_params,
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01,
+            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, n_rows_dst, s01,
             s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd,
             ne11_fd, ne12_fd);
     }
@@ -232,6 +244,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (float*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -242,6 +255,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (half*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -252,6 +266,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (nv_bfloat16*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -262,6 +277,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q4_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -272,6 +288,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q4_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -282,6 +299,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q5_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -292,6 +310,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q5_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -302,6 +321,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q8_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -312,6 +332,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_iq4_nl*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -337,6 +358,7 @@ void set_rows_cuda<half, int32_t>(ggml_backend_cuda_context & ctx, const ggml_te
             src0_d, src1_d, (half*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -362,6 +384,7 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
             src0_d, src1_d, (half*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            ne1,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
