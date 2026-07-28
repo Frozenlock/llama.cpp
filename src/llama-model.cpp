@@ -337,6 +337,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
 
+    // LLAMA_KV_SHARD=1: block-cyclic position shard of the MLA latent KV
+    // cache across pair members (halves per-member KV memory; see
+    // ~/KV-SHARD-DESIGN.md). Default off.
+    static const bool kv_shard = [] {
+        const char * e = getenv("LLAMA_KV_SHARD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
@@ -453,7 +461,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 #endif
         if (hparams.is_mla() && std::regex_match(tensor_name, pattern_kv_cache)) {
-            // latent KV cache has a single head shared by all query heads: mirror it
+            // latent KV cache has a single head shared by all query heads.
+            // Default: mirror it on every pair member (2x KV memory).
+            // kv_shard: contiguous-halves position shard across the pair members
+            // - halves per-member KV bytes; reads are
+            // gathered via the scatter+allreduce path (see KV-SHARD-DESIGN).
+            if (kv_shard) {
+                // cache_k tensor: ne[0] = row (n_embd_k), ne[1] = positions
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
