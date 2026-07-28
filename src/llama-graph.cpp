@@ -2687,6 +2687,9 @@ ggml_tensor * llm_graph_context::build_attn(
         return e != nullptr && atoi(e) != 0;
     }();
     if (kv_shard) {
+        // get_k/get_v views are [head_dim, n_head_kv, n_kv] with positions
+        // outermost - contiguous order matches the cache's row order, so a
+        // plain cont receives the boundary's raw cache-row bytes correctly.
         k = ggml_cont(ctx0, k);
         ggml_format_name(k, "kvgather_k-%d", il);
         v = ggml_cont(ctx0, v);

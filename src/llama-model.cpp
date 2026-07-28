@@ -479,6 +479,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // standard attention
+        if (kv_shard && !hparams.is_mla()) {
+            // Position-sharded standard KV (debug/testbed parity with the MLA
+            // path): mirror the WHOLE attention block (like the
+            // TP_SPIKE_MIRROR_ATTN bisect mode) and shard only the cache by
+            // position. Splitting Q while mirroring KV would corrupt the
+            // in-kernel GQA head mapping (local ratio != global ratio); a
+            // groupwise-segmented Q split would fix that properly, but for
+            // the testbed redundant mirrored attention is simpler and
+            // exercises the identical shard machinery.
+            if (std::regex_match(tensor_name, pattern_q_weight)   || std::regex_match(tensor_name, pattern_q_bias)   ||
+                std::regex_match(tensor_name, pattern_kv_weight)  || std::regex_match(tensor_name, pattern_kv_bias)  ||
+                std::regex_match(tensor_name, pattern_qk_norm)    || std::regex_match(tensor_name, pattern_attn_sinks) ||
+                std::regex_match(tensor_name, pattern_attn_out_weight) || std::regex_match(tensor_name, pattern_attn_out_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+                tc.rotation = 0;
+                return tc;
+            }
+        }
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
