@@ -1453,13 +1453,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         pu_reused = true;
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
-
         if (pu_log) { pu2 = pu3 = pu4 = ggml_time_us(); } // reuse+sync lumped
 
         n_reused++;
@@ -1490,6 +1483,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         pu4 = pu_log ? ggml_time_us() : 0;
+    }
+
+    // with pipeline parallelism, the previous graph_compute_async may still be running
+    // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+    // that the previous compute is still reading. This must cover BOTH the reuse and the
+    // rebuild branch: set_inputs writes through the blocking buffer set_tensor path
+    // (cudaStreamPerThread), which is unordered vs. the compute streams. On the rebuild
+    // branch (chunk-size transition, prefill->decode) an unsynchronized set_inputs races
+    // in-flight ubatches whenever the host runs far ahead of the GPU — e.g. under
+    // per-stage CUDA graphs, which remove the launch-queue throttle (long-context
+    // retrieval corruption, root-caused 2026-07-28).
+    if (cparams.pipeline_parallel) {
+        ggml_backend_sched_synchronize(sched.get());
     }
 
     // set the input data for the input tensors
