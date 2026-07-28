@@ -1854,6 +1854,13 @@ struct ggml_backend_meta_context {
     // node index of the gather node for that subgraph (-1 otherwise)
     std::vector<uint8_t> subgraph_gather;
     std::vector<int>     subgraph_gather_node;
+    // per-member events used to order gather-boundary P2P copies against
+    // both members' in-flight kernels (lazily created)
+    std::vector<ggml_backend_event_t> gather_events;
+    // GGML_META_STAGE_KEEP_EXECS=1 bisect: captured graph execs whose
+    // destruction is deferred to the next graph_compute call (tests the
+    // destroy-while-launch-in-flight driver theory without adding syncs)
+    std::vector<std::pair<ggml_backend_t, void *>> kept_execs;
 
     void launch_pool_start() {
         // Opt-in (GGML_META_PARALLEL_LAUNCH=1): measured neutral for prefill on
@@ -1912,7 +1919,12 @@ struct ggml_backend_meta_context {
     uint64_t                       outer_graph_clock   = 0;
     bool                           outer_graph_enabled = false;
 
+    // creation-order ordinal (pair index for the TPxPP hybrid); bisect aid
+    int ctx_ord = -1;
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+        static std::atomic<int> next_ord{0};
+        ctx_ord = next_ord++;
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
         name = "Meta(";
@@ -1956,6 +1968,16 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        for (auto & e : gather_events) {
+            if (e != nullptr) {
+                ggml_backend_event_free(e);
+            }
+        }
+        for (auto & ke : kept_execs) {
+            if (capture_free != nullptr) {
+                capture_free(ke.first, ke.second);
+            }
+        }
         for (auto & w : launch_workers) {
             if (w) {
                 w->shutdown();
@@ -2726,6 +2748,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const bool parallel_launch = !backend_ctx->launch_workers.empty() && !tp_spike_dump &&
         !outer_capture_active && !stage_graph;
 
+    static const int stage_keep_execs = [](){
+        const char * e = getenv("GGML_META_STAGE_KEEP_EXECS");
+        return e ? atoi(e) : 0;
+    }();
+    // free execs kept alive since the previous call on this pair
+    if (!backend_ctx->kept_execs.empty()) {
+        for (auto & ke : backend_ctx->kept_execs) {
+            backend_ctx->capture_free(ke.first, ke.second);
+        }
+        backend_ctx->kept_execs.clear();
+    }
+
     for (int pass = 0; ; pass++) {
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
@@ -2752,7 +2786,83 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             bool captured = false;
-            if (stage_graph && bcj.cgraphs[i].cgraph_main->n_nodes >= 8) {
+            static const int stage_min_nodes = [](){
+                const char * e = getenv("GGML_META_STAGE_MIN_NODES");
+                const int v = e ? atoi(e) : 0;
+                return v > 0 ? v : 8;
+            }();
+            // Bisect knob for the stage-capture x P2P-gather interaction:
+            // GGML_META_STAGE_SKIP=1 -> no captures in graphs containing any
+            // gather boundary; =2 -> skip only the producer (ends at gather)
+            // and consumer (follows gather) subgraphs.
+            static const int stage_skip = [](){
+                const char * e = getenv("GGML_META_STAGE_SKIP");
+                return e ? atoi(e) : 0;
+            }();
+            // Range bisect: capture only subgraphs with IMIN <= i <= IMAX.
+            static const int stage_imin = [](){
+                const char * e = getenv("GGML_META_STAGE_IMIN");
+                return e ? atoi(e) : 0;
+            }();
+            static const int stage_imax = [](){
+                const char * e = getenv("GGML_META_STAGE_IMAX");
+                return e ? atoi(e) : INT32_MAX;
+            }();
+            // Pair bisect: capture only in the meta context with this
+            // creation ordinal (pair index); -1 = all pairs.
+            static const int stage_pair = [](){
+                const char * e = getenv("GGML_META_STAGE_PAIR");
+                return e ? atoi(e) : -1;
+            }();
+            bool skip_capture = (int) i < stage_imin || (int) i > stage_imax ||
+                (stage_pair >= 0 && backend_ctx->ctx_ord != stage_pair);
+            // One-shot node listing of a chosen subgraph (bisect aid):
+            static const int dump_sg = [](){
+                const char * e = getenv("GGML_META_STAGE_DUMP_SUBGRAPH");
+                return e ? atoi(e) : -1;
+            }();
+            if (dump_sg >= 0 && (int) i == dump_sg && j == 0) {
+                static int sg_dumped = 0;
+                if (sg_dumped < 2) {
+                    sg_dumped++;
+                    ggml_cgraph * cgd = bcj.cgraphs[i].cgraph_main;
+                    fprintf(stderr, "[SGDUMP] subgraph %zu n_nodes=%d:", i, cgd->n_nodes);
+                    for (int nn = 0; nn < cgd->n_nodes; nn++) {
+                        fprintf(stderr, " %s(%s)", ggml_op_name(cgd->nodes[nn]->op), cgd->nodes[nn]->name);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+            }
+            if (stage_skip == 1) {
+                for (size_t g = 0; g < backend_ctx->subgraph_gather.size(); g++) {
+                    if (backend_ctx->subgraph_gather[g] != 0) { skip_capture = true; break; }
+                }
+            } else if (stage_skip == 2) {
+                const bool ends_at_gather    = i < backend_ctx->subgraph_gather.size() && backend_ctx->subgraph_gather[i] != 0;
+                const bool follows_gather    = i > 0 && i - 1 < backend_ctx->subgraph_gather.size() && backend_ctx->subgraph_gather[i - 1] != 0;
+                skip_capture = ends_at_gather || follows_gather;
+            } else if (stage_skip == 3) {
+                // CUB-theory bisect: skip capture for stages containing ops
+                // whose CUDA impls go through CUB device algorithms (argsort/
+                // top-k/cumsum/sum/mean) — suspected silently capture-unsafe.
+                ggml_cgraph * cgs = bcj.cgraphs[i].cgraph_main;
+                for (int nn = 0; nn < cgs->n_nodes; nn++) {
+                    const ggml_op op = cgs->nodes[nn]->op;
+                    if (op == GGML_OP_ARGSORT || op == GGML_OP_TOP_K ||
+                        op == GGML_OP_CUMSUM || op == GGML_OP_SUM ||
+                        op == GGML_OP_MEAN) {
+                        skip_capture = true;
+                        static std::atomic<int> n_cub_skips{0};
+                        const int ns = ++n_cub_skips;
+                        if (ns <= 2 || ns % 512 == 0) {
+                            fprintf(stderr, "[STAGE-SKIP3] skipped CUB stage (op=%s) n=%d\n", ggml_op_name(op), ns);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!skip_capture && stage_graph && bcj.cgraphs[i].cgraph_main->n_nodes >= stage_min_nodes) {
                 if (backend_ctx->capture_begin(bcj.backend)) {
                     const ggml_status cstatus = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
                     if (cstatus != GGML_STATUS_SUCCESS) {
@@ -2761,8 +2871,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     void * exec = backend_ctx->capture_end(bcj.backend);
                     if (exec != nullptr) {
+                        // Bisect knob: host-drain the member right after each
+                        // captured launch. Clean under drain => capture only
+                        // shifts timing and exposes an external ordering race;
+                        // corrupt under drain => the captured execution itself
+                        // computes wrong data.
+                        static const int stage_drain = [](){
+                            const char * e = getenv("GGML_META_STAGE_DRAIN");
+                            return e ? atoi(e) : 0;
+                        }();
+                        // Bisect knob: capture then DISCARD without launching,
+                        // falling through to the plain enqueue. Corrupt =>
+                        // the act of capturing perturbs stream state; clean =>
+                        // the replayed launch is at fault.
+                        static const int stage_nolaunch = [](){
+                            const char * e = getenv("GGML_META_STAGE_NOLAUNCH");
+                            return e ? atoi(e) : 0;
+                        }();
+                        if (stage_nolaunch) {
+                            backend_ctx->capture_free(bcj.backend, exec);
+                            exec = nullptr;
+                        } else
                         if (backend_ctx->capture_launch(bcj.backend, exec)) {
                             captured = true;
+                            if (stage_drain) {
+                                ggml_backend_synchronize(bcj.backend);
+                            }
                             static std::atomic<int> n_stage_captures{0};
                             const int n = ++n_stage_captures;
                             if (n == 1 || n % 512 == 0) {
@@ -2771,7 +2905,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                         // cudaGraphExecDestroy defers destruction until the
                         // in-flight launch completes
-                        backend_ctx->capture_free(bcj.backend, exec);
+                        if (exec != nullptr) {
+                            if (stage_keep_execs) {
+                                backend_ctx->kept_execs.emplace_back(bcj.backend, exec);
+                            } else {
+                                backend_ctx->capture_free(bcj.backend, exec);
+                            }
+                        }
                     }
                     // capture_end failure: nothing was executed; fall through
                     // to the plain enqueue below
@@ -2836,68 +2976,137 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const ggml_backend_meta_split_state cache_ss = ggml_backend_meta_get_split_state(meta_cache, /*assume_sync =*/ false);
             GGML_ASSERT(cache_ss.n_segments == 1);
 
-            std::vector<std::vector<char>> bounce(n_backends);
             std::vector<size_t> take_bytes(n_backends);
-            int64_t rows_left = view_rows;
-            for (size_t j = 0; j < n_backends; j++) {
-                const int64_t member_rows = cache_ss.ne[j];
-                const int64_t take = std::min(rows_left, member_rows);
-                rows_left -= take;
-                take_bytes[j] = (size_t) take * row_bytes;
-                if (take_bytes[j] == 0) {
-                    continue;
-                }
-                auto & bcj = backend_ctx->backend_configs[j];
-                ggml_backend_synchronize(bcj.backend);
-                ggml_tensor * cache_j = ggml_backend_meta_buffer_simple_tensor(meta_cache, j);
-                bounce[j].resize(take_bytes[j]);
-                ggml_backend_tensor_get(cache_j, bounce[j].data(), 0, take_bytes[j]);
-            }
-            GGML_ASSERT(rows_left == 0);
-            // Sync ALL members before host-writing their gather nodes: the
-            // gather node's galloc region can alias earlier tensors of this
-            // subgraph, and galloc's reuse planning assumes in-stream order.
-            // A member with take_bytes==0 (no rows to contribute) was never
-            // synced by the bounce loop above; writing its gather node while
-            // its kernels are in flight corrupts the aliased region.
-            for (size_t j = 0; j < n_backends; j++) {
-                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
-            }
             {
-                static const int gdump = [](){
-                    const char * e = getenv("LLAMA_KV_SHARD_DUMP");
+                int64_t rows_left = view_rows;
+                for (size_t j = 0; j < n_backends; j++) {
+                    const int64_t take = std::min(rows_left, cache_ss.ne[j]);
+                    rows_left -= take;
+                    take_bytes[j] = (size_t) take * row_bytes;
+                }
+                GGML_ASSERT(rows_left == 0);
+            }
+
+            static const int gdump = [](){
+                const char * e = getenv("LLAMA_KV_SHARD_DUMP");
+                return e ? atoi(e) : 0;
+            }();
+
+            if (gdump <= 0) {
+                // S2a fast path: exchange cache halves member-to-member with
+                // stream-ordered device copies; the host never blocks.
+                //
+                // Ordering requirements, both satisfied on-device via events:
+                // 1. A copy must run after the SRC member's subgraph<=i kernels
+                //    (its set_rows) - guaranteed by issuing on the src stream.
+                // 2. A copy writing member k's gather node must run after
+                //    member k's own in-flight subgraph<=i kernels, because the
+                //    gather node's galloc region can alias their memory (the
+                //    S1 host-write race). Guaranteed by making every src
+                //    stream wait on every other member's recorded event first.
+                // Subsequent subgraphs on the dst stream are ordered after the
+                // incoming copy by cpy_tensor_async's own event chain.
+                auto & gev = backend_ctx->gather_events;
+                if (gev.size() < n_backends) {
+                    gev.resize(n_backends, nullptr);
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    if (gev[j] == nullptr) {
+                        gev[j] = ggml_backend_event_new(ggml_backend_get_device(bcj.backend));
+                        GGML_ASSERT(gev[j] != nullptr);
+                    }
+                    ggml_backend_event_record(gev[j], bcj.backend);
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    for (size_t k = 0; k < n_backends; k++) {
+                        if (j != k) {
+                            ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, gev[k]);
+                        }
+                    }
+                }
+                for (size_t idst = 0; idst < n_backends; idst++) {
+                    auto & bci = backend_ctx->backend_configs[idst];
+                    ggml_cgraph * cgi = bci.cgraphs[i].cgraph_main;
+                    ggml_tensor * gnode = cgi->nodes[cgi->n_nodes - 1];
+                    size_t off_j = 0;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (take_bytes[j] == 0) {
+                            continue;
+                        }
+                        ggml_tensor * cache_j = ggml_backend_meta_buffer_simple_tensor(meta_cache, j);
+                        ggml_tensor tsrc{};
+                        tsrc.type = GGML_TYPE_I8;
+                        tsrc.ne[0] = (int64_t) take_bytes[j]; tsrc.ne[1] = tsrc.ne[2] = tsrc.ne[3] = 1;
+                        tsrc.nb[0] = 1; tsrc.nb[1] = tsrc.nb[2] = tsrc.nb[3] = take_bytes[j];
+                        tsrc.data   = cache_j->data;
+                        tsrc.buffer = cache_j->buffer;
+                        ggml_tensor tdst = tsrc;
+                        tdst.data   = (char *) gnode->data + off_j;
+                        tdst.buffer = gnode->buffer;
+                        ggml_backend_tensor_copy_async(backend_ctx->backend_configs[j].backend, bci.backend, &tsrc, &tdst);
+                        off_j += take_bytes[j];
+                    }
+                }
+                // Bisect knob: GGML_META_GATHER_SYNC=1 drains both members
+                // after the copies (makes the P2P path as strongly ordered as
+                // the S1 host bounce, at full-stall cost).
+                static const int gsync = [](){
+                    const char * e = getenv("GGML_META_GATHER_SYNC");
                     return e ? atoi(e) : 0;
                 }();
-                if (gdump > 0) {
-                    fprintf(stderr, "[KVSGATH] %s view_rows=%lld row_bytes=%zu ss.ne={%lld,%lld}\n",
-                            meta_g->name, (long long) view_rows, row_bytes,
-                            (long long) cache_ss.ne[0], (long long) (n_backends > 1 ? cache_ss.ne[1] : 0));
+                if (gsync != 0) {
                     for (size_t j = 0; j < n_backends; j++) {
-                        const int64_t rows_j = std::min<int64_t>((int64_t) (take_bytes[j] / row_bytes), gdump);
-                        fprintf(stderr, "[KVSGATH]   member%zu take_rows=%zu blocks16:", j, take_bytes[j] / row_bytes);
-                        for (int64_t r0 = 0; r0 < rows_j; r0 += 16) {
-                            uint64_t h = 1469598103934665603ULL;
-                            const size_t lo = (size_t) r0 * row_bytes;
-                            const size_t hi = std::min((size_t) take_bytes[j], (size_t) (r0 + 16) * row_bytes);
-                            for (size_t k = lo; k < hi; k++) {
-                                h = (h ^ (uint8_t) bounce[j][k]) * 1099511628211ULL;
-                            }
-                            fprintf(stderr, " %03lld:%08x", (long long) r0, (uint32_t) (h & 0xffffffff));
-                        }
-                        fprintf(stderr, "\n");
+                        ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
                     }
-                    fflush(stderr);
                 }
-            }
-            for (size_t idst = 0; idst < n_backends; idst++) {
-                auto & bci = backend_ctx->backend_configs[idst];
-                ggml_cgraph * cgi = bci.cgraphs[i].cgraph_main;
-                ggml_tensor * gnode = cgi->nodes[cgi->n_nodes - 1];
-                size_t off_j = 0;
+            } else {
+                // Debug path (LLAMA_KV_SHARD_DUMP=<nrows>): host bounce with
+                // full member syncs + block checksums of the exchanged rows.
+                std::vector<std::vector<char>> bounce(n_backends);
                 for (size_t j = 0; j < n_backends; j++) {
-                    if (take_bytes[j] > 0) {
-                        ggml_backend_tensor_set(gnode, bounce[j].data(), off_j, take_bytes[j]);
-                        off_j += take_bytes[j];
+                    if (take_bytes[j] == 0) {
+                        continue;
+                    }
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_backend_synchronize(bcj.backend);
+                    ggml_tensor * cache_j = ggml_backend_meta_buffer_simple_tensor(meta_cache, j);
+                    bounce[j].resize(take_bytes[j]);
+                    ggml_backend_tensor_get(cache_j, bounce[j].data(), 0, take_bytes[j]);
+                }
+                // sync ALL members before host-writing gather nodes (galloc
+                // aliasing - see fast-path comment; this was the S1 race)
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                }
+                fprintf(stderr, "[KVSGATH] %s view_rows=%lld row_bytes=%zu ss.ne={%lld,%lld}\n",
+                        meta_g->name, (long long) view_rows, row_bytes,
+                        (long long) cache_ss.ne[0], (long long) (n_backends > 1 ? cache_ss.ne[1] : 0));
+                for (size_t j = 0; j < n_backends; j++) {
+                    const int64_t rows_j = std::min<int64_t>((int64_t) (take_bytes[j] / row_bytes), gdump);
+                    fprintf(stderr, "[KVSGATH]   member%zu take_rows=%zu blocks16:", j, take_bytes[j] / row_bytes);
+                    for (int64_t r0 = 0; r0 < rows_j; r0 += 16) {
+                        uint64_t h = 1469598103934665603ULL;
+                        const size_t lo = (size_t) r0 * row_bytes;
+                        const size_t hi = std::min((size_t) take_bytes[j], (size_t) (r0 + 16) * row_bytes);
+                        for (size_t k = lo; k < hi; k++) {
+                            h = (h ^ (uint8_t) bounce[j][k]) * 1099511628211ULL;
+                        }
+                        fprintf(stderr, " %03lld:%08x", (long long) r0, (uint32_t) (h & 0xffffffff));
+                    }
+                    fprintf(stderr, "\n");
+                }
+                fflush(stderr);
+                for (size_t idst = 0; idst < n_backends; idst++) {
+                    auto & bci = backend_ctx->backend_configs[idst];
+                    ggml_cgraph * cgi = bci.cgraphs[i].cgraph_main;
+                    ggml_tensor * gnode = cgi->nodes[cgi->n_nodes - 1];
+                    size_t off_j = 0;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (take_bytes[j] > 0) {
+                            ggml_backend_tensor_set(gnode, bounce[j].data(), off_j, take_bytes[j]);
+                            off_j += take_bytes[j];
+                        }
                     }
                 }
             }
