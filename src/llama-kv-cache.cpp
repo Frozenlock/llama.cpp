@@ -1735,6 +1735,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // The graph may not use this mask (e.g. the GLM-DSA sparse gather path builds its own
+    // all-zero mask over the gathered keys), in which case the sched leaves it unallocated.
+    // set_input is called unconditionally, so skip filling an unused (unallocated) mask.
+    if (dst->buffer == nullptr) {
+        return;
+    }
+
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));

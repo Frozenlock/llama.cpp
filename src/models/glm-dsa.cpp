@@ -153,6 +153,19 @@ std::unique_ptr<llm_graph_context> llama_model_glm_dsa::build_arch_graph(const l
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
+    // LLAMA_GLM_SPARSE: GLM-5.2 is a DeepSeek-Sparse-Attention model whose indexer
+    // weights are loaded but unused by the default (dense deepseek2) graph. The
+    // deepseek32 graph is deepseek2 + the DSA indexer/top_k sparse path; since GLM
+    // already runs correctly on deepseek2's graph, reuse the deepseek32 graph to
+    // activate the trained sparse attention. Requires the DSA (mla+lid) KV cache,
+    // enabled for GLM_DSA under the same flag in llama-model.cpp.
+    static const bool glm_sparse = []() {
+        const char * e = getenv("LLAMA_GLM_SPARSE");
+        return e && atoi(e) != 0;
+    }();
+    if (glm_sparse) {
+        return std::make_unique<llama_model_deepseek32::graph>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 

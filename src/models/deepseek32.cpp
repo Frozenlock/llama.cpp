@@ -239,8 +239,12 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                                  ggml_row_size(indexer_q->type, n_embd_indexer_head_nope));
                 cb(indexer_q_nope, "indexer_q_nope", il);
 
+                // Use the model's rope convention (not hardcoded NEOX): GLM-5.2's
+                // indexer weights are stored interleaved (LLAMA_ROPE_TYPE_NORM) and
+                // are NOT permuted at conversion, unlike the main q/k. deepseek3.2's
+                // rope_type is NEOX, so this is a no-op there.
                 indexer_q_pe = ggml_rope_ext(ctx0, indexer_q_pe, inp_pos, nullptr, n_rot,
-                                     LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
+                                     rope_type, n_ctx_orig, freq_base, freq_scale,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(indexer_q_pe, "indexer_q_pe", il);
 
@@ -270,7 +274,7 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 cb(indexer_k_nope, "indexer_k_nope", il);
 
                 indexer_k_pe = ggml_rope_ext(ctx0, indexer_k_pe, inp_pos, nullptr, n_rot,
-                                     LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
+                                     rope_type, n_ctx_orig, freq_base, freq_scale,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(indexer_k_pe, "indexer_k_pe", il);
 

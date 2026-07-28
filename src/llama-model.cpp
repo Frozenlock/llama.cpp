@@ -2189,6 +2189,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         nullptr);
             } break;
+        case LLM_ARCH_GLM_DSA:
+            // LLAMA_GLM_SPARSE: activate the trained DSA sparse path for GLM-5.2,
+            // which needs the dual (mla + lid indexer) KV cache. Without the flag,
+            // fall through to the standard cache (dense attention = default behavior).
+            if (const char * e = getenv("LLAMA_GLM_SPARSE"); e && atoi(e) != 0) {
+                res = new llama_kv_cache_dsa(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        1,
+                        hparams.n_swa,
+                        hparams.swa_type,
+                        nullptr,
+                        nullptr);
+                break;
+            }
+            [[fallthrough]];
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
         default:

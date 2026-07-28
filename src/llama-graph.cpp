@@ -2825,37 +2825,51 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = inp->get_kq_mask_mla();
 
-    // prepare new kq mask - starts filled with -INFINITY
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
-
-    // reshape KQ mask into tensor with rows of size 1:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
-
-    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
-
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-
-    // modify KQ mask by unmasking elements that are in top_k indices
-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
-
-    // reshape to restore the original shape of KQ mask:
-    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-    kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);   // [n_embd_k, 1, n_kv, n_stream]
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur;
+
+    // GLM-DSA sparse attention via GATHER (replaces the set_rows -inf mask, which does
+    // not execute correctly on the meta/TP backend). For DECODE (single query token) we
+    // gather ONLY the top-k selected K/V rows with ggml_get_rows - which reads just those
+    // rows from the cache - and attend densely over them. This both fixes correctness and
+    // cuts attention KV bandwidth ~n_kv/n_top_k x at long context (the actual speed win).
+    // PREFILL (n_tokens>1) stays dense: the KV cache is identical, and decode attends
+    // sparsely over it; per-token prefill gather would duplicate keys (BW-negative).
+    if (top_k != nullptr && n_tokens == 1 && k->ne[2] > top_k->ne[0]) {
+        const int64_t n_embd_k = k->ne[0];
+        const int64_t n_embd_v = v->ne[0];
+        const int64_t n_kv     = k->ne[2];
+        const int64_t n_stream = k->ne[3];
+        const int64_t n_sel    = top_k->ne[0];
+
+        // indices [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_stream] (n_batch==1 for decode)
+        ggml_tensor * idx = ggml_reshape_2d(ctx0, ggml_cont(ctx0, top_k), n_sel, n_stream);
+
+        // view the cache as [n_embd, n_kv, n_stream] (no copy) and gather selected rows
+        ggml_tensor * k_src = ggml_view_3d(ctx0, k, n_embd_k, n_kv, n_stream, k->nb[2], k->nb[3], 0);
+        ggml_tensor * v_src = ggml_view_3d(ctx0, k, n_embd_v, n_kv, n_stream, k->nb[2], k->nb[3], 0);
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_src, idx);  // [n_embd_k, n_sel, n_stream]
+        ggml_tensor * v_g = ggml_get_rows(ctx0, v_src, idx);  // [n_embd_v, n_sel, n_stream]
+        k_g = ggml_reshape_4d(ctx0, k_g, n_embd_k, 1, n_sel, n_stream);
+        v_g = ggml_reshape_4d(ctx0, v_g, n_embd_v, 1, n_sel, n_stream);
+
+        // All gathered keys are causally valid (the indexer selects only past positions),
+        // so the attention mask over them is all-zeros. Build a fresh F16 zero mask sized
+        // [n_sel, n_q_pad, 1, n_stream] using the original mask's query-padding/stream dims.
+        // (The full causal kq_mask is unused on this path; see set_input_kq_mask guard.)
+        GGML_UNUSED(n_stream);
+        ggml_tensor * m_g = ggml_fill(ctx0,
+            ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_sel, kq_mask->ne[1], 1, kq_mask->ne[3]),
+            0.0f);
+
+        cur = build_attn_mha(q, k_g, v_g, kq_b, m_g, sinks, v_mla, kq_scale, il);
+    } else {
+        // prefill (or n_kv <= top_k): dense causal attention over the full KV cache
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (wo) {
