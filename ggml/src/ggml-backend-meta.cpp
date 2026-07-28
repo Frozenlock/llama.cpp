@@ -2186,6 +2186,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 GGML_ASSERT(bcj.nodes[i]);
+
+                // KV-shard index rebase: a SET_ROWS whose destination is an
+                // axis1-sharded cache receives GLOBAL row ids (mirrored idx
+                // input). Member j owns rows [base_j, base_j + ne[j]); encode
+                // base_j in op_params[0] so the CUDA kernel can rebase and
+                // its bounds guard drops out-of-shard rows. CUDA-only: the
+                // CPU set_rows path does not read this parameter.
+                if (node->op == GGML_OP_SET_ROWS && node->src[2] != nullptr) {
+                    ggml_tensor * dst_root = node->src[2]->view_src != nullptr ? node->src[2]->view_src : node->src[2];
+                    const ggml_backend_meta_split_state dss = ggml_backend_meta_get_split_state(dst_root, /*assume_sync =*/ false);
+                    if (dss.axis == GGML_BACKEND_SPLIT_AXIS_1 && dss.n_segments == 1) {
+                        int64_t base_j = 0;
+                        for (size_t jj = 0; jj < j; jj++) {
+                            base_j += dss.ne[jj];
+                        }
+                        GGML_ASSERT(base_j <= INT32_MAX);
+                        ggml_set_op_params_i32(bcj.nodes[i], 0, (int32_t) base_j);
+                        static int inject_logged = 0;
+                        if (inject_logged < 4) {
+                            inject_logged++;
+                            fprintf(stderr, "[KVSBASE] inject member=%zu node=%s base=%lld ptr=%p\n",
+                                    j, node->name, (long long) base_j, (void *) bcj.nodes[i]);
+                        }
+                    }
+                }
             }
         }
 

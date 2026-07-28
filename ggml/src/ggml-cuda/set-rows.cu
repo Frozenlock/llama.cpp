@@ -14,6 +14,7 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const int64_t ne12,
                                         const int64_t ne13,
                                         const int64_t n_rows_dst,
+                                        const int64_t row_base,
                                         const int64_t s01,
                                         const int64_t s02,
                                         const int64_t s03,
@@ -55,7 +56,7 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     const int64_t i10 = i01;
 
     ggml_cuda_pdl_sync();
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - row_base;
     if (dst_row < 0 || dst_row >= n_rows_dst) {
         // out-of-shard row (position-sharded KV cache): this member skips it
         return;
@@ -82,6 +83,7 @@ static void set_rows_cuda_quant(
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t n_rows_dst,
+        const int64_t row_base,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
@@ -111,7 +113,7 @@ static void set_rows_cuda_quant(
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
         k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, n_rows_dst, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
+            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, n_rows_dst, row_base, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd);
     }
 }
@@ -126,6 +128,7 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
                                   const int64_t ne12,
                                   const int64_t ne13,
                                   const int64_t n_rows_dst,
+                                  const int64_t row_base,
                                   const int64_t s01,
                                   const int64_t s02,
                                   const int64_t s03,
@@ -169,7 +172,7 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
     const int64_t i10 = i01;
 
     ggml_cuda_pdl_sync();
-    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12) - row_base;
     if (dst_row < 0 || dst_row >= n_rows_dst) {
         // out-of-shard row (position-sharded KV cache): this member skips it
         return;
@@ -193,6 +196,7 @@ static void set_rows_cuda(
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t n_rows_dst,
+        const int64_t row_base,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
@@ -223,7 +227,7 @@ static void set_rows_cuda(
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_size, block_size, 0, stream);
         ggml_cuda_kernel_launch(k_set_rows<src_t, idx_t, dst_t>, launch_params,
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, n_rows_dst, s01,
+            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, n_rows_dst, row_base, s01,
             s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd,
             ne11_fd, ne12_fd);
     }
@@ -236,6 +240,11 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // Row-id rebase for position-sharded KV caches (set by the meta backend
+    // in op_params[0]; 0 in all other cases): indices are global row ids,
+    // this member owns rows [row_base, row_base + ne1).
+    const int64_t row_base = ((const int32_t *) dst->op_params)[0];
+
     cudaStream_t stream = ctx.stream();
 
 
@@ -244,7 +253,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (float*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -255,7 +264,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (half*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -266,7 +275,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (nv_bfloat16*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -277,7 +286,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q4_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -288,7 +297,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q4_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -299,7 +308,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q5_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -310,7 +319,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q5_1*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -321,7 +330,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_q8_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -332,7 +341,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_iq4_nl*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -350,6 +359,11 @@ void set_rows_cuda<half, int32_t>(ggml_backend_cuda_context & ctx, const ggml_te
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // Row-id rebase for position-sharded KV caches (set by the meta backend
+    // in op_params[0]; 0 in all other cases): indices are global row ids,
+    // this member owns rows [row_base, row_base + ne1).
+    const int64_t row_base = ((const int32_t *) dst->op_params)[0];
+
     cudaStream_t stream = ctx.stream();
 
 
@@ -358,7 +372,7 @@ void set_rows_cuda<half, int32_t>(ggml_backend_cuda_context & ctx, const ggml_te
             src0_d, src1_d, (half*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -376,6 +390,11 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // Row-id rebase for position-sharded KV caches (set by the meta backend
+    // in op_params[0]; 0 in all other cases): indices are global row ids,
+    // this member owns rows [row_base, row_base + ne1).
+    const int64_t row_base = ((const int32_t *) dst->op_params)[0];
+
     cudaStream_t stream = ctx.stream();
 
 
@@ -384,7 +403,7 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
             src0_d, src1_d, (half*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
-            ne1,
+            ne1, row_base,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
@@ -399,6 +418,15 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    {
+        static int base_logged = 0;
+        const int32_t rb = ((const int32_t *) dst->op_params)[0];
+        if (rb != 0 && base_logged < 4) {
+            base_logged++;
+            fprintf(stderr, "[KVSBASE] cuda-op node=%s row_base=%d ptr=%p\n", dst->name, rb, (void *) dst);
+        }
+    }
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
