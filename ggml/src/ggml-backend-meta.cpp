@@ -2611,9 +2611,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (!backend_ctx->launch_pool_started) {
         backend_ctx->launch_pool_start();
     }
+    // Per-stage CUDA graphs (GGML_META_STAGE_GRAPH=1): capture each subgraph's
+    // ~thousands of kernel launches into one executable graph and launch it
+    // once. Capture does not touch the device's pending-launch queue, so the
+    // host can enqueue arbitrarily far ahead — this removes the launch-queue
+    // wall that caps prefill pipeline depth at ~2 stages. Prefill passes only
+    // (uid == 0; decode/verify passes go through the outer capture instead).
+    static const bool stage_graph_env = [] {
+        const char * e = getenv("GGML_META_STAGE_GRAPH");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    bool stage_graph = stage_graph_env && !tp_spike_dump && !outer_capture_active &&
+        backend_ctx->capture_begin && backend_ctx->capture_end &&
+        backend_ctx->capture_launch && backend_ctx->capture_free && backend_ctx->capture_abort;
+    if (stage_graph) {
+        // prefill passes only: capture+instantiate overhead (~10ms/stage) is
+        // amortized over large ubatches, not per decode token. Detect prefill
+        // by batch width — decode/verify passes stay <= ~16 tokens.
+        int64_t max_batch = 0;
+        const int n_scan = std::min(cgraph->n_nodes, 48);
+        for (int k = 0; k < n_scan; k++) {
+            max_batch = std::max(max_batch, cgraph->nodes[k]->ne[1]);
+        }
+        stage_graph = max_batch >= 64;
+    }
     // stream capture is thread-sensitive: workers must stand down while an
-    // outer-capture pass is recording
-    const bool parallel_launch = !backend_ctx->launch_workers.empty() && !tp_spike_dump && !outer_capture_active;
+    // outer-capture pass is recording; stage capture also takes precedence
+    const bool parallel_launch = !backend_ctx->launch_workers.empty() && !tp_spike_dump &&
+        !outer_capture_active && !stage_graph;
 
     for (int pass = 0; ; pass++) {
 
@@ -2640,6 +2665,35 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         } else {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            bool captured = false;
+            if (stage_graph && bcj.cgraphs[i].cgraph_main->n_nodes >= 8) {
+                if (backend_ctx->capture_begin(bcj.backend)) {
+                    const ggml_status cstatus = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                    if (cstatus != GGML_STATUS_SUCCESS) {
+                        backend_ctx->capture_abort(bcj.backend);
+                        return cstatus;
+                    }
+                    void * exec = backend_ctx->capture_end(bcj.backend);
+                    if (exec != nullptr) {
+                        if (backend_ctx->capture_launch(bcj.backend, exec)) {
+                            captured = true;
+                            static std::atomic<int> n_stage_captures{0};
+                            const int n = ++n_stage_captures;
+                            if (n == 1 || n % 512 == 0) {
+                                fprintf(stderr, "META-STAGE-GRAPH: %d stage captures\n", n);
+                            }
+                        }
+                        // cudaGraphExecDestroy defers destruction until the
+                        // in-flight launch completes
+                        backend_ctx->capture_free(bcj.backend, exec);
+                    }
+                    // capture_end failure: nothing was executed; fall through
+                    // to the plain enqueue below
+                }
+            }
+            if (captured) {
+                continue;
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
