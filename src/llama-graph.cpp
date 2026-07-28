@@ -2679,6 +2679,20 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // LLAMA_KV_SHARD: the cache is position-sharded across the TP pair;
+    // gather the halves into mirrored full-size tensors at a meta gather
+    // boundary before attention (see KV-SHARD-DESIGN.md).
+    static const bool kv_shard = [] {
+        const char * e = getenv("LLAMA_KV_SHARD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (kv_shard) {
+        k = ggml_cont(ctx0, k);
+        ggml_format_name(k, "kvgather_k-%d", il);
+        v = ggml_cont(ctx0, v);
+        ggml_format_name(v, "kvgather_v-%d", il);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2768,6 +2782,19 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+
+    // LLAMA_KV_SHARD: the MLA latent cache is position-sharded across the TP
+    // pair; gather the halves into a mirrored full-size tensor at a meta
+    // gather boundary before attention. V is a view into the gathered K.
+    static const bool kv_shard = [] {
+        const char * e = getenv("LLAMA_KV_SHARD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (kv_shard) {
+        k = ggml_cont(ctx0, k);
+        ggml_format_name(k, "kvgather_k-%d", il);
+    }
+
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);

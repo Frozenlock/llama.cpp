@@ -43,6 +43,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
             return "MIRRORED";
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
             return "PARTIAL";
+        case GGML_BACKEND_SPLIT_AXIS_GATHER1:
+            return "GATHER1";
         case GGML_BACKEND_SPLIT_AXIS_NONE:
             return "NONE";
         case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
@@ -1020,6 +1022,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_im
             } break;
             case GGML_OP_CONT:
             case GGML_OP_RESHAPE: {
+                // Position-sharded KV (LLAMA_KV_SHARD): a cont named
+                // "kvgather*" over an axis-1-split tensor marks a gather
+                // boundary - the subgraph splitter breaks here and the
+                // boundary code exchanges the halves into the full
+                // (mirrored) per-member buffers. Consumers (assume_sync)
+                // see the result as mirrored; allocation is full-size.
+                if (tensor->op == GGML_OP_CONT &&
+                        (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                         src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2) &&
+                        strncmp(tensor->name, "kvgather", 8) == 0) {
+                    split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_GATHER1, {0}, {1}, 1};
+                    break;
+                }
                 split_state = handle_reshape(src_ss);
             } break;
             case GGML_OP_VIEW: {
@@ -1376,6 +1391,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             if (ne_sum == 0) {
                 simple_tensors[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
             }
+        }
+    }
+
+    // Gather-boundary nodes (position-sharded KV) are filled by the boundary
+    // exchange code, never computed per member (their per-member src is a
+    // half while the dst is full-size).
+    if (tensor->op == GGML_OP_CONT && strncmp(tensor->name, "kvgather", 8) == 0) {
+        for (size_t j = 0; j < n_simple_bufs; j++) {
+            simple_tensors[j]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
         }
     }
 
@@ -1825,6 +1849,10 @@ struct ggml_backend_meta_context {
     std::vector<std::unique_ptr<launch_worker>> launch_workers; // size n_backends-1 once started
     bool launch_pool_started = false;
 
+    // per-subgraph boundary kind: 1 = gather (position-sharded KV halves
+    // exchange), 0 = normal (allreduce / none)
+    std::vector<uint8_t> subgraph_gather;
+
     void launch_pool_start() {
         // Opt-in (GGML_META_PARALLEL_LAUNCH=1): measured neutral for prefill on
         // the clean rig (815 t/s with and without) — the launch bottleneck is
@@ -2271,12 +2299,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool is_gather = split_state.axis == GGML_BACKEND_SPLIT_AXIS_GATHER1;
+                const bool new_subgraph = i + 1 == cgraph->n_nodes ||
+                    split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || is_gather;
                 if (!new_subgraph) {
                     continue;
                 }
+                if (backend_ctx->subgraph_gather.size() <= n_subgraphs) {
+                    backend_ctx->subgraph_gather.resize(n_subgraphs + 1, 0);
+                }
+                backend_ctx->subgraph_gather[n_subgraphs] = is_gather ? 1 : 0;
 
-                const int i_delayed = get_i_delayed(i);
+                const int i_delayed = is_gather ? (int) i : get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -2571,6 +2605,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (cg->n_nodes < 1 || ggml_nbytes(cg->nodes[cg->n_nodes - 1]) > 256 * 1024) {
                     og->capturable = false;
                 }
+                // gather boundaries (position-sharded KV) host-synchronize
+                // between subgraphs - never capturable
+                if (i < backend_ctx->subgraph_gather.size() && backend_ctx->subgraph_gather[i] != 0) {
+                    og->capturable = false;
+                }
             }
         }
         og->last_used = ++backend_ctx->outer_graph_clock;
@@ -2749,7 +2788,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         const int64_t t1 = tp_time ? ggml_time_us() : 0;
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+        const bool gather_boundary = n_backends > 1 &&
+            i < backend_ctx->subgraph_gather.size() && backend_ctx->subgraph_gather[i] != 0;
+        if (gather_boundary) {
+            // Position-sharded KV gather: each member's half (the gather
+            // node's src) is exchanged into every member's full-size gather
+            // buffer (the node itself; compute flag cleared at init).
+            // Correctness-first host bounce; S2 replaces this boundary with
+            // partial-attention merge.
+            std::vector<std::vector<char>> bounce(n_backends);
+            std::vector<size_t> half_bytes(n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * cgj = bcj.cgraphs[i].cgraph_main;
+                ggml_tensor * gnode_j = cgj->nodes[cgj->n_nodes - 1];
+                ggml_tensor * half_j  = gnode_j->src[0];
+                ggml_backend_synchronize(bcj.backend);
+                half_bytes[j] = ggml_nbytes(half_j);
+                bounce[j].resize(half_bytes[j]);
+                ggml_backend_tensor_get(half_j, bounce[j].data(), 0, half_bytes[j]);
+            }
+            for (size_t idst = 0; idst < n_backends; idst++) {
+                auto & bci = backend_ctx->backend_configs[idst];
+                ggml_cgraph * cgi = bci.cgraphs[i].cgraph_main;
+                ggml_tensor * gnode = cgi->nodes[cgi->n_nodes - 1];
+                size_t off_j = 0;
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_backend_tensor_set(gnode, bounce[j].data(), off_j, half_bytes[j]);
+                    off_j += half_bytes[j];
+                }
+            }
+        }
+
+        if (!gather_boundary && n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
