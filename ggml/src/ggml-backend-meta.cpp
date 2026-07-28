@@ -11,6 +11,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <map>
 #include <memory>
 #include <set>
@@ -1732,6 +1736,96 @@ struct ggml_backend_meta_context {
             bufs.resize(n_reduce_steps);
         }
     };
+    // Launch pool: host-side kernel enqueueing is serial over pair members and
+    // shows up as cuLaunchKernel throttling during prefill. Member launches
+    // within a subgraph are independent (CUDA is thread-safe; the CUDA backend
+    // sets its device per call), so members 1..n-1 launch on persistent
+    // workers while member 0 launches on the caller. Handoff is a short spin
+    // (arm->run gap is ~us) with a condition-variable fallback so idle workers
+    // don't burn CPU between tokens. GGML_META_PARALLEL_LAUNCH=0 disables.
+    struct launch_worker {
+        std::thread             thread;
+        std::mutex              mtx;
+        std::condition_variable cv;
+        std::atomic<int>        state{0};        // 0 idle, 1 armed, 2 done, -1 shutdown
+        ggml_backend_t          job_backend = nullptr;
+        ggml_cgraph *           job_cgraph  = nullptr;
+        ggml_status             job_status  = GGML_STATUS_SUCCESS;
+
+        void run() {
+            for (;;) {
+                int spins = 0;
+                while (state.load(std::memory_order_acquire) == 0 && spins < 2000) {
+                    spins++;
+                    std::this_thread::yield();
+                }
+                if (state.load(std::memory_order_acquire) == 0) {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return state.load(std::memory_order_acquire) != 0; });
+                }
+                const int s = state.load(std::memory_order_acquire);
+                if (s == -1) {
+                    return;
+                }
+                if (s == 1) {
+                    job_status = ggml_backend_graph_compute_async(job_backend, job_cgraph);
+                    state.store(2, std::memory_order_release);
+                }
+            }
+        }
+
+        void arm(ggml_backend_t backend, ggml_cgraph * cgraph) {
+            job_backend = backend;
+            job_cgraph  = cgraph;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                state.store(1, std::memory_order_release);
+            }
+            cv.notify_one();
+        }
+
+        ggml_status join() {
+            while (state.load(std::memory_order_acquire) != 2) {
+                std::this_thread::yield();
+            }
+            state.store(0, std::memory_order_release);
+            return job_status;
+        }
+
+        void shutdown() {
+            if (!thread.joinable()) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                state.store(-1, std::memory_order_release);
+            }
+            cv.notify_one();
+            thread.join();
+        }
+    };
+    std::vector<std::unique_ptr<launch_worker>> launch_workers; // size n_backends-1 once started
+    bool launch_pool_started = false;
+
+    void launch_pool_start() {
+        // Opt-in (GGML_META_PARALLEL_LAUNCH=1): measured neutral for prefill on
+        // the clean rig (815 t/s with and without) — the launch bottleneck is
+        // the per-device pending-launch queue, not the serial member loop.
+        static const bool enabled = [] {
+            const char * env = getenv("GGML_META_PARALLEL_LAUNCH");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        launch_pool_started = true;
+        if (!enabled || backend_configs.size() < 2) {
+            return;
+        }
+        launch_workers.resize(backend_configs.size() - 1);
+        for (auto & w : launch_workers) {
+            w = std::make_unique<launch_worker>();
+            w->thread = std::thread([worker = w.get()] { worker->run(); });
+        }
+    }
+
     std::string                 name;
     std::vector<backend_config> backend_configs;
     ggml_context_ptr            ctx;
@@ -1814,6 +1908,11 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        for (auto & w : launch_workers) {
+            if (w) {
+                w->shutdown();
+            }
+        }
         for (auto & e : outer_graphs) {
             for (size_t j = 0; j < e.execs.size(); j++) {
                 if (e.execs[j] != nullptr && capture_free != nullptr) {
@@ -2508,10 +2607,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     const size_t iga0 = iga;
     const size_t ina0 = ina;
+
+    if (!backend_ctx->launch_pool_started) {
+        backend_ctx->launch_pool_start();
+    }
+    // stream capture is thread-sensitive: workers must stand down while an
+    // outer-capture pass is recording
+    const bool parallel_launch = !backend_ctx->launch_workers.empty() && !tp_spike_dump && !outer_capture_active;
+
     for (int pass = 0; ; pass++) {
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         const int64_t t0 = tp_time ? ggml_time_us() : 0;
+        if (parallel_launch) {
+            // members 1..n-1 enqueue on persistent workers, member 0 here
+            for (size_t j = 1; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                backend_ctx->launch_workers[j - 1]->arm(bcj.backend, bcj.cgraphs[i].cgraph_main);
+            }
+            auto & bc0 = backend_ctx->backend_configs[0];
+            const ggml_status status0 = ggml_backend_graph_compute_async(bc0.backend, bc0.cgraphs[i].cgraph_main);
+            ggml_status status_all = status0;
+            for (size_t j = 1; j < n_backends; j++) {
+                const ggml_status sj = backend_ctx->launch_workers[j - 1]->join();
+                if (sj != GGML_STATUS_SUCCESS) {
+                    status_all = sj;
+                }
+            }
+            if (status_all != GGML_STATUS_SUCCESS) {
+                return status_all;
+            }
+        } else {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -2546,6 +2672,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         n_sample > 6 ? buf[6] : 0.f, n_sample > 7 ? buf[7] : 0.f);
                 }
             }
+        }
         }
 
         const int64_t t1 = tp_time ? ggml_time_us() : 0;
@@ -2747,6 +2874,27 @@ static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_
                 mev_record, mev_wait);
     }
     if (!ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst)) {
+        // Host -> meta input uploads (kq_mask, positions, ...): route through
+        // the member-wise async set path instead of failing into the sched's
+        // synchronous fallback (event_synchronize + device-syncing plain copy
+        // per split input, ~2 dozen host blocks per ubatch during prefill).
+        if (ggml_backend_is_meta(backend_dst) &&
+                dst->buffer != nullptr && ggml_backend_buffer_is_meta(dst->buffer) &&
+                src->buffer != nullptr && ggml_backend_buffer_is_host(src->buffer) &&
+                ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+                ggml_are_same_shape(src, dst) && src->type == dst->type) {
+            // only for split states set_tensor_async can map; anything else
+            // (PARTIAL, multi-segment, replicated rows) keeps the safe fallback
+            const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+            const bool supported = ss.n_segments == 1 && ss.nr[0] == 1 &&
+                (ss.axis == GGML_BACKEND_SPLIT_AXIS_0 || ss.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                 ss.axis == GGML_BACKEND_SPLIT_AXIS_2 || ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (supported) {
+                ggml_backend_meta_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+                mcpy_ok++;
+                return true;
+            }
+        }
         mcpy_fail[0]++;
         return false;
     }
