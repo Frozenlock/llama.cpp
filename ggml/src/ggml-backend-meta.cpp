@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -116,6 +117,8 @@ static enum ggml_backend_dev_type ggml_backend_meta_device_get_type(ggml_backend
     GGML_UNUSED(dev);
 }
 
+static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
+
 static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -130,7 +133,10 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
 
     props->caps = {
         /* .async                 = */ true,
-        /* .host_buffer           = */ false, // Not implemented.
+        // Host (pinned) buffers are forwarded from the member devices when they
+        // all share one host buffer type (see get_host_buffer_type); required
+        // for the model loader's chunked async-upload fast path.
+        /* .host_buffer           = */ ggml_backend_meta_device_get_host_buffer_type(dev) != nullptr,
         /* .buffer_from_host_ptr  = */ false, // Not implemented.
         /* .events                = */ true, // Meta events fan out to member-device events.
     };
@@ -524,7 +530,38 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// Memoize split-state computation, which recurses through each tensor's source
+// subtree and re-derives shared subtrees O(consumers) times. The cache is active
+// for the duration of one immutable graph compute, activated via
+// ggml_backend_meta_split_cache_begin/end() around the whole sched split-walk
+// (see ggml_backend_sched_compute_splits) so it also covers the hot inter-split
+// copy path (get_tensor_backend / cpy_tensor), not just per-split graph_compute.
+// Results are always correct because the graph is immutable within the scope;
+// outside a scope the pointer is null and we fall through to the uncached impl.
+struct ggml_backend_meta_split_cache_entry { ggml_backend_meta_split_state ss[2]; bool valid[2] = {false, false}; };
+static thread_local std::unordered_map<const ggml_tensor *, ggml_backend_meta_split_cache_entry> * g_meta_split_cache = nullptr;
+
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_impl(
+        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync);
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+        ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
+    if (g_meta_split_cache == nullptr) {
+        return ggml_backend_meta_get_split_state_impl(stc, tensor, assume_sync);
+    }
+    const int idx = assume_sync ? 1 : 0;
+    auto it = g_meta_split_cache->find(tensor);
+    if (it != g_meta_split_cache->end() && it->second.valid[idx]) {
+        return it->second.ss[idx];
+    }
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state_impl(stc, tensor, assume_sync);
+    auto & e = (*g_meta_split_cache)[tensor];
+    e.ss[idx] = ss;
+    e.valid[idx] = true;
+    return ss;
+}
+
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_impl(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
@@ -1811,8 +1848,8 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
+    GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
@@ -1822,13 +1859,16 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
-            // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
+            // Contiguous layout above the split axis: the tensor is a sequence
+            // of "planes" of chunk_size_full bytes; within each plane, member j
+            // owns the contiguous byte range [member_off, member_off + chunk_size_j).
+            // Supports arbitrary [offset, offset + size) ranges (needed by the
+            // model loader's chunked async uploads) by intersecting the range
+            // with each member's slice in every plane it touches.
             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
-            GGML_ASSERT(offset % chunk_size_full == 0);
-            GGML_ASSERT(size   % chunk_size_full == 0);
-            const int64_t i_start =  offset        /chunk_size_full;
-            const int64_t i_stop  = (offset + size)/chunk_size_full;
-            size_t offset_j = 0;
+            const int64_t p_first =  offset            / chunk_size_full;
+            const int64_t p_last  = (offset + size - 1) / chunk_size_full;
+            size_t member_off = 0;
             for (size_t j = 0; j < n_backends; j++){
                 ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
@@ -1836,11 +1876,44 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
-                    i_stop - i_start, chunk_size_j, chunk_size_full);
-                offset_j += chunk_size_j;
+                // Per member: partial head/tail planes copied individually, the
+                // run of fully-covered planes in one strided 2D copy (a 64MB
+                // chunk can span tens of thousands of planes for axis-0 splits).
+                auto copy_partial = [&](int64_t p) {
+                    const size_t slice_beg = p*chunk_size_full + member_off;
+                    const size_t r_beg = std::max<size_t>(offset,        slice_beg);
+                    const size_t r_end = std::min<size_t>(offset + size, slice_beg + chunk_size_j);
+                    if (r_beg < r_end) {
+                        ggml_backend_tensor_set_async(simple_backend, simple_tensor,
+                            (const char *) data + (r_beg - offset),
+                            (size_t) p*chunk_size_j + (r_beg - slice_beg), r_end - r_beg);
+                    }
+                };
+                if (p_first == p_last) {
+                    // single plane: copy_partial clips to both range ends
+                    copy_partial(p_first);
+                } else {
+                    // full planes: member slice entirely inside [offset, offset+size)
+                    int64_t pf_first = p_first;
+                    int64_t pf_last  = p_last;
+                    if ((size_t) p_first*chunk_size_full + member_off < offset) {
+                        copy_partial(p_first);
+                        pf_first = p_first + 1;
+                    }
+                    if ((size_t) p_last*chunk_size_full + member_off + chunk_size_j > offset + size) {
+                        copy_partial(p_last);
+                        pf_last = p_last - 1;
+                    }
+                    if (pf_last >= pf_first) {
+                        ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor,
+                            (const char *) data + (pf_first*chunk_size_full + member_off - offset),
+                            (size_t) pf_first*chunk_size_j, chunk_size_j,
+                            pf_last - pf_first + 1, chunk_size_j, chunk_size_full);
+                    }
+                }
+                member_off += chunk_size_j;
             }
-            GGML_ASSERT(offset_j == chunk_size_full);
+            GGML_ASSERT(member_off == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_backends; j++) {
@@ -1908,6 +1981,9 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
+    // Split-state memo cache is scoped around the whole sched split-walk by
+    // ggml_backend_sched_compute_splits (begin/end), covering both this per-split
+    // compute and the inter-split copy path. No per-split scope here.
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
@@ -2565,6 +2641,64 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 (long long)((acc_total - acc_launch - acc_reduce)/n_tok));
         }
     }
+
+    // LLAMA_GLM_SPARSE_DUMP: dump layer-0 DSA indexer_score / top_k selection.
+    // Works through the meta backend (unlike the sched eval callback, which never
+    // sees nodes internal to a meta split): scan this split's cgraph, sync, and
+    // read the reconstructed tensor via the meta buffer's get_tensor.
+    static const bool glm_dump = getenv("LLAMA_GLM_SPARSE_DUMP") != nullptr;
+    if (glm_dump) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            const bool want = strcmp(node->name, "top_k-0") == 0 || strcmp(node->name, "indexer_score-0") == 0 || strcmp(node->name, "glm_mask-0") == 0 || strcmp(node->name, "glm_setrows-0") == 0;
+            if (!want) {
+                continue;
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
+            const size_t esz = ggml_type_size(node->type);
+            size_t cap = ggml_nelements(node);
+            if (cap > 4096) cap = 4096;
+            while (esz > 0 && cap * esz > ggml_nbytes(node)) cap--;   // bounds-safe
+            if (node->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(cap);
+                ggml_backend_tensor_get(node, v.data(), 0, cap * sizeof(int32_t));
+                int32_t mn = v[0], mx = v[0];
+                long lo = 0;
+                for (size_t k = 0; k < cap; k++) { if (v[k] < mn) mn = v[k]; if (v[k] > mx) mx = v[k]; if (v[k] >= 0 && v[k] < 64) lo++; }
+                fprintf(stderr, "[GLMDUMP] %s I32 ne=[%lld,%lld] min=%d max=%d (#<64=%ld) first24=",
+                        node->name, (long long)node->ne[0], (long long)node->ne[1], mn, mx, lo);
+                for (size_t k = 0; k < 24 && k < cap; k++) fprintf(stderr, "%d ", v[k]);
+                fprintf(stderr, "\n"); fflush(stderr);
+            } else if (node->type == GGML_TYPE_F16) {
+                // mask: F16 zero (0x0000) = unmasked, 0xFC00 = -inf (masked)
+                std::vector<uint16_t> v(cap);
+                ggml_backend_tensor_get(node, v.data(), 0, cap * sizeof(uint16_t));
+                long unmasked = 0, masked = 0;
+                for (size_t k = 0; k < cap; k++) { if (v[k] == 0) unmasked++; else masked++; }
+                fprintf(stderr, "[GLMDUMP] %s F16 ne=[%lld,%lld] unmasked(==0)=%ld masked=%ld pos0_31=",
+                        node->name, (long long)node->ne[0], (long long)node->ne[1], unmasked, masked);
+                for (size_t k = 0; k < 32 && k < cap; k++) fprintf(stderr, "%c", v[k] == 0 ? 'U' : '.');
+                fprintf(stderr, "\n"); fflush(stderr);
+            } else {
+                std::vector<float> v(cap);
+                ggml_backend_tensor_get(node, v.data(), 0, cap * sizeof(float));
+                float mn = 1e30f, mx = -1e30f; long unmasked = 0, masked = 0;
+                for (size_t k = 0; k < cap; k++) {
+                    const float x = v[k];
+                    if (x > -1e30f && x < mn) mn = x;
+                    if (x > mx && x < 1e30f) mx = x;
+                    if (x == 0.0f) unmasked++; else masked++;
+                }
+                fprintf(stderr, "[GLMDUMP] %s F32 ne=[%lld,%lld] finite_min=%.4f max=%.4f unmasked(==0)=%ld masked=%ld pos0_23=",
+                        node->name, (long long)node->ne[0], (long long)node->ne[1], mn, mx, unmasked, masked);
+                for (size_t k = 0; k < 24 && k < cap; k++) fprintf(stderr, "%c", v[k] == 0.0f ? 'U' : (v[k] <= -1e30f ? '.' : '?'));
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 

@@ -15,6 +15,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -79,6 +82,38 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// LLAMA_GLM_SPARSE_DUMP: diagnostic eval callback. Dumps layer-0 indexer_score
+// stats and the top_k selected KV indices, to check whether the DSA indexer is
+// picking sane positions (e.g. whether early/needle positions are ever selected).
+static bool glm_sparse_dump_cb(struct ggml_tensor * t, bool ask, void * /*ud*/) {
+    const bool want = (strcmp(t->name, "top_k-0") == 0) || (strcmp(t->name, "indexer_score-0") == 0);
+    if (ask) {
+        return want;
+    }
+    if (!want) {
+        return true;
+    }
+    const size_t n   = ggml_nelements(t);
+    const size_t cap = n < 6000 ? n : 6000;
+    if (t->type == GGML_TYPE_I32) {
+        std::vector<int32_t> v(cap);
+        ggml_backend_tensor_get(t, v.data(), 0, cap * sizeof(int32_t));
+        int32_t mn = v[0], mx = v[0];
+        long lo = 0;
+        for (size_t i = 0; i < cap; i++) { if (v[i] < mn) mn = v[i]; if (v[i] > mx) mx = v[i]; if (v[i] >= 0 && v[i] < 64) lo++; }
+        fprintf(stderr, "[GLMDUMP] %s I32 n=%zu min=%d max=%d (#sel_in_first64=%ld) tok0_first20=", t->name, n, mn, mx, lo);
+        for (size_t i = 0; i < 20 && i < cap; i++) fprintf(stderr, "%d ", v[i]);
+        fprintf(stderr, "\n"); fflush(stderr);
+    } else {
+        std::vector<float> v(cap);
+        ggml_backend_tensor_get(t, v.data(), 0, cap * sizeof(float));
+        float mn = v[0], mx = v[0], s = 0.0f;
+        for (size_t i = 0; i < cap; i++) { if (v[i] < mn) mn = v[i]; if (v[i] > mx) mx = v[i]; s += v[i]; }
+        fprintf(stderr, "[GLMDUMP] %s F32 n=%zu min=%.4f max=%.4f mean=%.5f\n", t->name, n, mn, mx, s / cap); fflush(stderr);
+    }
+    return true;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -136,6 +171,15 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    // NOTE: registering any eval callback forces ggml_backend_sched into its
+    // per-chunk synchronize path, which serializes TPxPP pipeline overlap.
+    // Gate on the env VALUE, not presence: "0" must mean off.
+    if (!cparams.cb_eval) {
+        const char * dump_env = getenv("LLAMA_GLM_SPARSE_DUMP");
+        if (dump_env && atoi(dump_env) != 0) {
+            cparams.cb_eval = glm_sparse_dump_cb;
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -252,6 +296,17 @@ llama_context::llama_context(
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
+
+    // LLAMA_GLM_SPARSE: activate the (otherwise dead) GLM-DSA sparse attention path.
+    // The fused lightning-indexer op is NOT supported by the TP meta-backend
+    // (GGML_OP_LIGHTNING_INDEXER aborts in get_split_state), so force the unfused
+    // indexer path and skip the auto-probe (which would run the fused op and abort).
+    if (const char * e = getenv("LLAMA_GLM_SPARSE")) {
+        if (atoi(e) != 0) {
+            cparams.fused_lid = false;
+            cparams.auto_flid = false;
+        }
+    }
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;

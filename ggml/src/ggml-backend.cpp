@@ -1558,13 +1558,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                // Inputs from the user must be copied before the user overwrites them.
+                // Instead of host-blocking here per split (event_synchronize + blocking
+                // copy), use the async path: the copies complete on-stream, and the
+                // per-ubatch drain in process_ubatch (before the next set_inputs) already
+                // guarantees they finish before the input buffer is reused. Falls back to
+                // the safe blocking path if the async copy isn't available.
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (!split_backend->iface.cpy_tensor_async ||
+                        !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
