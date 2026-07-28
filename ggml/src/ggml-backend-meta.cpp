@@ -2829,6 +2829,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_backend_tensor_get(cache_j, bounce[j].data(), 0, take_bytes[j]);
             }
             GGML_ASSERT(rows_left == 0);
+            // Sync ALL members before host-writing their gather nodes: the
+            // gather node's galloc region can alias earlier tensors of this
+            // subgraph, and galloc's reuse planning assumes in-stream order.
+            // A member with take_bytes==0 (no rows to contribute) was never
+            // synced by the bounce loop above; writing its gather node while
+            // its kernels are in flight corrupts the aliased region.
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
+            {
+                static const int gdump = [](){
+                    const char * e = getenv("LLAMA_KV_SHARD_DUMP");
+                    return e ? atoi(e) : 0;
+                }();
+                if (gdump > 0) {
+                    fprintf(stderr, "[KVSGATH] %s view_rows=%lld row_bytes=%zu ss.ne={%lld,%lld}\n",
+                            meta_g->name, (long long) view_rows, row_bytes,
+                            (long long) cache_ss.ne[0], (long long) (n_backends > 1 ? cache_ss.ne[1] : 0));
+                    for (size_t j = 0; j < n_backends; j++) {
+                        const int64_t rows_j = std::min<int64_t>((int64_t) (take_bytes[j] / row_bytes), gdump);
+                        fprintf(stderr, "[KVSGATH]   member%zu take_rows=%zu blocks16:", j, take_bytes[j] / row_bytes);
+                        for (int64_t r0 = 0; r0 < rows_j; r0 += 16) {
+                            uint64_t h = 1469598103934665603ULL;
+                            const size_t lo = (size_t) r0 * row_bytes;
+                            const size_t hi = std::min((size_t) take_bytes[j], (size_t) (r0 + 16) * row_bytes);
+                            for (size_t k = lo; k < hi; k++) {
+                                h = (h ^ (uint8_t) bounce[j][k]) * 1099511628211ULL;
+                            }
+                            fprintf(stderr, " %03lld:%08x", (long long) r0, (uint32_t) (h & 0xffffffff));
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    fflush(stderr);
+                }
+            }
             for (size_t idst = 0; idst < n_backends; idst++) {
                 auto & bci = backend_ctx->backend_configs[idst];
                 ggml_cgraph * cgi = bci.cgraphs[i].cgraph_main;
@@ -2988,6 +3023,58 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         node->name, (long long)node->ne[0], (long long)node->ne[1], mn, mx, unmasked, masked);
                 for (size_t k = 0; k < 24 && k < cap; k++) fprintf(stderr, "%c", v[k] == 0.0f ? 'U' : (v[k] <= -1e30f ? '.' : '?'));
                 fprintf(stderr, "\n"); fflush(stderr);
+            }
+        }
+    }
+
+    // KV-shard contents-diff harness: LLAMA_KV_SHARD_DUMP=<nrows> dumps
+    // per-member block checksums of the layer-0 K cache after every graph.
+    // Works under both KVSHARD=0 (mirrored) and =1 (sharded) so outputs can
+    // be diffed directly. Value-gated (atoi>0), never enabled by presence.
+    {
+        static const int dump_rows = [](){
+            const char * e = getenv("LLAMA_KV_SHARD_DUMP");
+            return e ? atoi(e) : 0;
+        }();
+        if (dump_rows > 0) {
+            std::vector<ggml_tensor *> caches;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * n = cgraph->nodes[i];
+                if (n->op != GGML_OP_SET_ROWS || n->src[2] == nullptr) {
+                    continue;
+                }
+                ggml_tensor * dst = n->src[2];
+                ggml_tensor * root = dst->view_src != nullptr ? dst->view_src : dst;
+                if (strstr(root->name, "cache_k_l") != nullptr &&
+                        std::find(caches.begin(), caches.end(), root) == caches.end()) {
+                    caches.push_back(root);
+                }
+            }
+            for (ggml_tensor * meta_cache : caches) {
+                const ggml_backend_meta_split_state css = ggml_backend_meta_get_split_state(meta_cache, /*assume_sync =*/ false);
+                const size_t row_bytes = meta_cache->nb[1];
+                fprintf(stderr, "[KVSDUMP] graph=%d cache=%s axis=%d ne1=%lld ss.ne={%lld,%lld} row_bytes=%zu\n",
+                        (int) cgraph->uid, meta_cache->name, (int) css.axis, (long long) meta_cache->ne[1],
+                        (long long) css.ne[0], (long long) (n_backends > 1 ? css.ne[1] : 0), row_bytes);
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_tensor * cache_j = ggml_backend_meta_buffer_simple_tensor(meta_cache, j);
+                    ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                    const int64_t rows_j = std::min<int64_t>(dump_rows, cache_j->ne[1]);
+                    std::vector<char> buf((size_t) rows_j * row_bytes);
+                    ggml_backend_tensor_get(cache_j, buf.data(), 0, buf.size());
+                    fprintf(stderr, "[KVSDUMP]   member%zu ne1=%lld blocks16:", j, (long long) cache_j->ne[1]);
+                    for (int64_t r0 = 0; r0 < rows_j; r0 += 16) {
+                        uint64_t h = 1469598103934665603ULL;
+                        const size_t lo = (size_t) r0 * row_bytes;
+                        const size_t hi = std::min(buf.size(), (size_t) (r0 + 16) * row_bytes);
+                        for (size_t k = lo; k < hi; k++) {
+                            h = (h ^ (uint8_t) buf[k]) * 1099511628211ULL;
+                        }
+                        fprintf(stderr, " %03lld:%08x", (long long) r0, (uint32_t) (h & 0xffffffff));
+                    }
+                    fprintf(stderr, "\n");
+                }
+                fflush(stderr);
             }
         }
     }
