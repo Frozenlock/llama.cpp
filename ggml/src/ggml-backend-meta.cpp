@@ -1850,8 +1850,10 @@ struct ggml_backend_meta_context {
     bool launch_pool_started = false;
 
     // per-subgraph boundary kind: 1 = gather (position-sharded KV halves
-    // exchange), 0 = normal (allreduce / none)
+    // exchange), 0 = normal (allreduce / none); _node holds the meta-graph
+    // node index of the gather node for that subgraph (-1 otherwise)
     std::vector<uint8_t> subgraph_gather;
+    std::vector<int>     subgraph_gather_node;
 
     void launch_pool_start() {
         // Opt-in (GGML_META_PARALLEL_LAUNCH=1): measured neutral for prefill on
@@ -2307,8 +2309,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 if (backend_ctx->subgraph_gather.size() <= n_subgraphs) {
                     backend_ctx->subgraph_gather.resize(n_subgraphs + 1, 0);
+                    backend_ctx->subgraph_gather_node.resize(n_subgraphs + 1, -1);
                 }
                 backend_ctx->subgraph_gather[n_subgraphs] = is_gather ? 1 : 0;
+                backend_ctx->subgraph_gather_node[n_subgraphs] = is_gather ? i : -1;
 
                 const int i_delayed = is_gather ? (int) i : get_i_delayed(i);
 
@@ -2791,31 +2795,50 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const bool gather_boundary = n_backends > 1 &&
             i < backend_ctx->subgraph_gather.size() && backend_ctx->subgraph_gather[i] != 0;
         if (gather_boundary) {
-            // Position-sharded KV gather: each member's half (the gather
-            // node's src) is exchanged into every member's full-size gather
-            // buffer (the node itself; compute flag cleared at init).
+            // Position-sharded KV gather. Per-member VIEW tensors of the
+            // split cache mis-map row counts (a view's rows get distributed
+            // proportionally), so ranges are computed from the PARENT cache's
+            // split state instead: member j owns parent_ss.ne[j] rows, in
+            // member order (rotation forced to 0 for the sharded cache).
             // Correctness-first host bounce; S2 replaces this boundary with
             // partial-attention merge.
+            ggml_tensor * meta_g     = cgraph->nodes[backend_ctx->subgraph_gather_node[i]];
+            ggml_tensor * meta_view  = meta_g->src[0];
+            ggml_tensor * meta_cache = meta_view->view_src != nullptr ? meta_view->view_src : meta_view;
+            GGML_ASSERT(meta_view->view_offs == 0 && "sharded KV gather expects views starting at row 0");
+            const size_t row_bytes = meta_cache->nb[1];
+            const int64_t view_rows = (int64_t) (ggml_nbytes(meta_g) / row_bytes);
+            const ggml_backend_meta_split_state cache_ss = ggml_backend_meta_get_split_state(meta_cache, /*assume_sync =*/ false);
+            GGML_ASSERT(cache_ss.n_segments == 1);
+
             std::vector<std::vector<char>> bounce(n_backends);
-            std::vector<size_t> half_bytes(n_backends);
+            std::vector<size_t> take_bytes(n_backends);
+            int64_t rows_left = view_rows;
             for (size_t j = 0; j < n_backends; j++) {
+                const int64_t member_rows = cache_ss.ne[j];
+                const int64_t take = std::min(rows_left, member_rows);
+                rows_left -= take;
+                take_bytes[j] = (size_t) take * row_bytes;
+                if (take_bytes[j] == 0) {
+                    continue;
+                }
                 auto & bcj = backend_ctx->backend_configs[j];
-                ggml_cgraph * cgj = bcj.cgraphs[i].cgraph_main;
-                ggml_tensor * gnode_j = cgj->nodes[cgj->n_nodes - 1];
-                ggml_tensor * half_j  = gnode_j->src[0];
                 ggml_backend_synchronize(bcj.backend);
-                half_bytes[j] = ggml_nbytes(half_j);
-                bounce[j].resize(half_bytes[j]);
-                ggml_backend_tensor_get(half_j, bounce[j].data(), 0, half_bytes[j]);
+                ggml_tensor * cache_j = ggml_backend_meta_buffer_simple_tensor(meta_cache, j);
+                bounce[j].resize(take_bytes[j]);
+                ggml_backend_tensor_get(cache_j, bounce[j].data(), 0, take_bytes[j]);
             }
+            GGML_ASSERT(rows_left == 0);
             for (size_t idst = 0; idst < n_backends; idst++) {
                 auto & bci = backend_ctx->backend_configs[idst];
                 ggml_cgraph * cgi = bci.cgraphs[i].cgraph_main;
                 ggml_tensor * gnode = cgi->nodes[cgi->n_nodes - 1];
                 size_t off_j = 0;
                 for (size_t j = 0; j < n_backends; j++) {
-                    ggml_backend_tensor_set(gnode, bounce[j].data(), off_j, half_bytes[j]);
-                    off_j += half_bytes[j];
+                    if (take_bytes[j] > 0) {
+                        ggml_backend_tensor_set(gnode, bounce[j].data(), off_j, take_bytes[j]);
+                        off_j += take_bytes[j];
+                    }
                 }
             }
         }

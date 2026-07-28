@@ -467,8 +467,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // - halves per-member KV bytes; reads are
             // gathered via the scatter+allreduce path (see KV-SHARD-DESIGN).
             if (kv_shard) {
-                // cache_k tensor: ne[0] = row (n_embd_k), ne[1] = positions
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+                // cache_k tensor: ne[0] = row (n_embd_k), ne[1] = positions.
+                // Stable ownership required by the gather boundary: member 0
+                // always holds the FIRST half of positions (no per-layer
+                // rotation).
+                tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+                tc.rotation = 0;
+                return tc;
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
