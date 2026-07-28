@@ -11,7 +11,9 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
+#include <utility>
 #include <vector>
 
 struct llama_model;
@@ -390,6 +392,14 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // Input-leaf write guard for pipeline parallelism: before set_inputs may
+    // overwrite graph-input leafs, the host waits only for the streams of the
+    // backends that OWN those leafs (the pipeline front), not the whole sched.
+    // Ring of 2 event sets, alternating per ubatch (1-back wait).
+    std::vector<ggml_backend_t> input_leaf_backends;
+    std::array<std::vector<std::pair<ggml_backend_t, ggml_backend_event_t>>, 2> input_guard_ev;
+    int  input_guard_slot = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;

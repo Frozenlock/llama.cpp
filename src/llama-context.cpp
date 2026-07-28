@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -544,6 +545,14 @@ llama_context::~llama_context() {
             ggml_backend_event_free(ev);
             ev = nullptr;
         }
+    }
+    for (auto & slot : input_guard_ev) {
+        for (auto & be : slot) {
+            if (be.second != nullptr) {
+                ggml_backend_event_free(be.second);
+            }
+        }
+        slot.clear();
     }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1482,20 +1491,69 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // recompute the set of backends owning graph-input leafs (guard below);
+        // this only changes when the graph topology does, i.e. on rebuild
+        if (cparams.pipeline_parallel) {
+            input_leaf_backends.clear();
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < n_nodes; i++) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    ggml_tensor * s = node->src[j];
+                    if (s == nullptr || !(s->flags & GGML_TENSOR_FLAG_INPUT)) {
+                        continue;
+                    }
+                    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), s);
+                    if (b != nullptr &&
+                            std::find(input_leaf_backends.begin(), input_leaf_backends.end(), b) == input_leaf_backends.end()) {
+                        input_leaf_backends.push_back(b);
+                        static int leaf_dbg = 0;
+                        if (leaf_dbg < 8) {
+                            leaf_dbg++;
+                            LLAMA_LOG_INFO("input-leaf owner: %s (leaf %s)\n", ggml_backend_name(b), s->name);
+                        }
+                    }
+                }
+            }
+        }
+
         pu4 = pu_log ? ggml_time_us() : 0;
     }
 
     // with pipeline parallelism, the previous graph_compute_async may still be running
-    // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-    // that the previous compute is still reading. This must cover BOTH the reuse and the
-    // rebuild branch: set_inputs writes through the blocking buffer set_tensor path
-    // (cudaStreamPerThread), which is unordered vs. the compute streams. On the rebuild
-    // branch (chunk-size transition, prefill->decode) an unsynchronized set_inputs races
-    // in-flight ubatches whenever the host runs far ahead of the GPU — e.g. under
-    // per-stage CUDA graphs, which remove the launch-queue throttle (long-context
-    // retrieval corruption, root-caused 2026-07-28).
+    // on the GPU. we must guard set_inputs against overwriting graph-input leafs that
+    // in-flight work is still reading: set_inputs writes through the blocking buffer
+    // set_tensor path (cudaStreamPerThread), which is unordered vs. the compute streams.
+    // This must cover BOTH the reuse and the rebuild branch — on the rebuild branch
+    // (chunk-size transition, prefill->decode) an unguarded set_inputs races in-flight
+    // ubatches whenever the host runs far ahead of the GPU, e.g. under per-stage CUDA
+    // graphs, which remove the launch-queue throttle (long-context retrieval corruption,
+    // root-caused 2026-07-28).
+    //
+    // The pending readers of a leaf are enqueued on the streams of the backends that
+    // OWN the leafs (sched input copies issue on the src stream; everything else the
+    // sched already orders on-device via its per-copy events). So waiting for the
+    // previous ubatch's completion on the leaf-owner backends only (the pipeline
+    // front) is sufficient — a full sched drain here serializes prefill chunk
+    // pipelining (measured 1122 -> 273 t/s sharded). LLAMA_INPUT_SYNC_FULL=1 restores
+    // the full drain as a bisect fallback.
     if (cparams.pipeline_parallel) {
-        ggml_backend_sched_synchronize(sched.get());
+        static const bool input_sync_full = [](){
+            const char * e = getenv("LLAMA_INPUT_SYNC_FULL");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (input_sync_full) {
+            ggml_backend_sched_synchronize(sched.get());
+        } else {
+            auto & prev_evs = input_guard_ev[input_guard_slot ^ 1];
+            for (auto & be : prev_evs) {
+                if (be.second != nullptr) {
+                    ggml_backend_event_synchronize(be.second);
+                } else {
+                    ggml_backend_synchronize(be.first);
+                }
+            }
+        }
     }
 
     // set the input data for the input tensors
@@ -1515,6 +1573,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // record input-guard events on the leaf-owner backends: the NEXT ubatch's
+    // set_inputs waits on these (1-back) before overwriting the input leafs
+    if (cparams.pipeline_parallel) {
+        auto & evs = input_guard_ev[input_guard_slot];
+        for (ggml_backend_t b : input_leaf_backends) {
+            auto it = std::find_if(evs.begin(), evs.end(),
+                    [b](const std::pair<ggml_backend_t, ggml_backend_event_t> & be) { return be.first == b; });
+            if (it == evs.end()) {
+                ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_get_device(b));
+                evs.emplace_back(b, ev); // ev may be nullptr -> wait falls back to backend synchronize
+                it = evs.end() - 1;
+            }
+            if (it->second != nullptr) {
+                ggml_backend_event_record(it->second, b);
+            }
+        }
+        input_guard_slot ^= 1;
     }
 
     if (pu_log) {

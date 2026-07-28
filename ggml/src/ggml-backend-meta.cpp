@@ -1862,6 +1862,98 @@ struct ggml_backend_meta_context {
     // destroy-while-launch-in-flight driver theory without adding syncs)
     std::vector<std::pair<ggml_backend_t, void *>> kept_execs;
 
+    // Pinned staging ring for host->meta COMPUTE-buffer uploads (graph inputs).
+    // cudaMemcpyAsync from pinned host memory reads the source at EXECUTION
+    // time; when the host runs far ahead of the GPU (per-stage CUDA graphs
+    // remove the launch-queue throttle), the caller may overwrite the source
+    // (set_inputs input leafs) while uploads from a previous ubatch are still
+    // pending -> long-context corruption. Bouncing through this ring makes the
+    // upload consume the source at ENQUEUE time; slot reuse is guarded by
+    // per-member events (ring depth 4 >> pipeline depth 2, waits ~never fire).
+    // Weights loads (USAGE_WEIGHTS buffers) bypass the ring.
+    struct staging_slot {
+        ggml_backend_buffer_ptr           buf;
+        size_t                            size = 0;
+        std::vector<ggml_backend_event_t> evs;      // per member, lazily created
+        bool                              pending = false;
+    };
+    // Size-tiered rings: small uploads (pos/embd/out_ids) cycle several times
+    // per ubatch — a deep ring keeps the host multiple ubatches ahead (the
+    // 7-pair pipeline needs ~7 chunks of host lead at the front). Large
+    // uploads (the KQ mask, ~n_kv*n_ub*2 bytes) are one per pair per ubatch —
+    // a shallow dedicated ring bounds pinned memory while still giving
+    // 4 ubatches of lead.
+    static constexpr size_t staging_small_max = 32u << 20;
+    std::array<staging_slot, 12> staging_small;
+    std::array<staging_slot, 4>  staging_large;
+    size_t staging_small_next = 0;
+    size_t staging_large_next = 0;
+
+    void * staging_acquire(size_t size) {
+        const bool large = size > staging_small_max;
+        staging_slot & s = large ? staging_large[staging_large_next] : staging_small[staging_small_next];
+        if (large) {
+            staging_large_next = (staging_large_next + 1) % staging_large.size();
+        } else {
+            staging_small_next = (staging_small_next + 1) % staging_small.size();
+        }
+        if (s.pending) {
+            for (ggml_backend_event_t ev : s.evs) {
+                if (ev != nullptr) {
+                    ggml_backend_event_synchronize(ev);
+                }
+            }
+            s.pending = false;
+        }
+        if (s.size < size) {
+            ggml_backend_dev_t dev0 = ggml_backend_get_device(backend_configs[0].backend);
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev0);
+            if (host_buft == nullptr) {
+                return nullptr; // no pinned host buffers on this backend
+            }
+            // small slots get 2x slack to avoid regrow churn; large slots
+            // (masks grow monotonically with n_kv) get 1.25x
+            const size_t alloc_size = large ? size + size/4 : std::max<size_t>(size, 4u << 20) * 2;
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft, alloc_size);
+            if (b == nullptr) {
+                return nullptr;
+            }
+            s.buf.reset(b);
+            s.size = alloc_size;
+        }
+        return ggml_backend_buffer_get_base(s.buf.get());
+    }
+
+    bool staging_commit_ring(void * base, staging_slot * ring, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            staging_slot & s = ring[i];
+            if (s.buf && ggml_backend_buffer_get_base(s.buf.get()) == base) {
+                if (s.evs.size() < backend_configs.size()) {
+                    s.evs.resize(backend_configs.size(), nullptr);
+                }
+                for (size_t j = 0; j < backend_configs.size(); j++) {
+                    if (s.evs[j] == nullptr) {
+                        s.evs[j] = ggml_backend_event_new(ggml_backend_get_device(backend_configs[j].backend));
+                    }
+                    if (s.evs[j] != nullptr) {
+                        ggml_backend_event_record(s.evs[j], backend_configs[j].backend);
+                    }
+                }
+                s.pending = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void staging_commit(void * base) {
+        if (staging_commit_ring(base, staging_small.data(), staging_small.size()) ||
+            staging_commit_ring(base, staging_large.data(), staging_large.size())) {
+            return;
+        }
+        GGML_ABORT("staging_commit: unknown staging base");
+    }
+
     void launch_pool_start() {
         // Opt-in (GGML_META_PARALLEL_LAUNCH=1): measured neutral for prefill on
         // the clean rig (815 t/s with and without) — the launch bottleneck is
@@ -1978,6 +2070,20 @@ struct ggml_backend_meta_context {
                 capture_free(ke.first, ke.second);
             }
         }
+        for (auto & s : staging_small) {
+            for (auto & ev : s.evs) {
+                if (ev != nullptr) {
+                    ggml_backend_event_free(ev);
+                }
+            }
+        }
+        for (auto & s : staging_large) {
+            for (auto & ev : s.evs) {
+                if (ev != nullptr) {
+                    ggml_backend_event_free(ev);
+                }
+            }
+        }
         for (auto & w : launch_workers) {
             if (w) {
                 w->shutdown();
@@ -2019,6 +2125,25 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(ggml_is_contiguous(tensor));
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+
+    // Graph-input uploads (COMPUTE buffers) bounce through the pinned staging
+    // ring so the source is consumed at enqueue time — the caller may reuse
+    // the source buffer while the async H2D of a prior ubatch is still
+    // pending (see staging ring comment). Weights loads bypass.
+    static const bool no_staging = [](){
+        const char * e = getenv("GGML_META_NO_INPUT_STAGING");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    void * staged = nullptr;
+    if (!no_staging && tensor->buffer != nullptr &&
+            ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        ggml_backend_meta_context * meta_ctx = (ggml_backend_meta_context *) backend->context;
+        staged = meta_ctx->staging_acquire(size);
+        if (staged != nullptr) {
+            memcpy(staged, data, size);
+            data = staged;
+        }
+    }
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
@@ -2093,6 +2218,10 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
         default: {
             GGML_ABORT("fatal error");
         }
+    }
+
+    if (staged != nullptr) {
+        ((ggml_backend_meta_context *) backend->context)->staging_commit(staged);
     }
 }
 
