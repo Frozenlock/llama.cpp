@@ -461,6 +461,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 #endif
         if (hparams.is_mla() && std::regex_match(tensor_name, pattern_kv_cache)) {
+            // DSA lightning-indexer key cache (row width = indexer_head_size,
+            // vs n_lora_kv+rope for the MLA latent): keep MIRRORED even under
+            // kv_shard — both members must score and select over ALL positions
+            // so the top-k stays member-identical. It is ~5x smaller per row
+            // than the latent cache, so mirroring barely dents the shard win.
+            if (kv_shard && hparams.indexer_head_size > 0 &&
+                    tensor->ne[0] == (int64_t) hparams.indexer_head_size) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             // latent KV cache has a single head shared by all query heads.
             // Default: mirror it on every pair member (2x KV memory).
             // kv_shard: contiguous-halves position shard across the pair members

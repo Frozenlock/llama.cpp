@@ -2857,6 +2857,22 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);   // [n_embd_k, 1, n_kv, n_stream]
+
+    // LLAMA_KV_SHARD: the MLA latent cache is position-sharded across the TP
+    // pair; gather the halves into a mirrored full-size tensor at a meta
+    // gather boundary before attention (same as the dense MLA overload). The
+    // lid (indexer) cache stays mirrored, so selection needs no gather; the
+    // sparse get_rows below then indexes the gathered full KV with global
+    // positions, which is correct by construction.
+    static const bool kv_shard_dsa = [] {
+        const char * e = getenv("LLAMA_KV_SHARD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (kv_shard_dsa) {
+        k = ggml_cont(ctx0, k);
+        ggml_format_name(k, "kvgather_k-%d", il);
+    }
+
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur;
