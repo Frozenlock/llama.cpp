@@ -52,7 +52,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_PARTIAL);
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -993,11 +993,12 @@ static __global__ void flash_attn_combine_to_partial(
     VKQ_parts += (int64_t) j_src * parallel_blocks*D;
     VKQ_meta  += (int64_t) j_src * parallel_blocks;
 
-    // dst is plain contiguous [D+2, ne01, ne02, 2]
+    // dst is plain contiguous [D+2, n_head, n_q, 2] - same head-fastest row
+    // order as the FA dst convention, so the row index equals j_src
     const int64_t row_stride = D + 2;
     const int64_t slot_sz    = (int64_t) ne01*ne02*row_stride;
-    float * out_own  = dst + member*slot_sz       + ((int64_t) head*ne01 + col)*row_stride;
-    float * out_peer = dst + (member ^ 1)*slot_sz + ((int64_t) head*ne01 + col)*row_stride;
+    float * out_own  = dst + member*slot_sz       + (int64_t) j_src*row_stride;
+    float * out_peer = dst + (member ^ 1)*slot_sz + (int64_t) j_src*row_stride;
 
     const int tid = threadIdx.x;
     __builtin_assume(tid < D);

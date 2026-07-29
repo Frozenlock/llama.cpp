@@ -6366,9 +6366,10 @@ struct ggml_tensor * ggml_flash_attn_partial(
         GGML_ASSERT(ggml_is_contiguous(mask));
     }
 
-    // [ numerator DV | max M | denom S ] x n_q x n_head x 2 member slots
-    // (dim order matches flash_attn_ext dst: [DV, n_q, n_head, seq])
-    int64_t ne[4] = { v->ne[0] + 2, q->ne[1], q->ne[2], 2 };
+    // [ numerator DV | max M | denom S ] rows, dim order matching the
+    // flash_attn_ext dst convention [DV, n_head, n_q] (head-fastest rows),
+    // with dim3 = the 2 member slots
+    int64_t ne[4] = { v->ne[0] + 2, q->ne[2], q->ne[1], 2 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
