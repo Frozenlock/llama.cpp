@@ -2,6 +2,10 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include <atomic>
+#include <cstring>
+#include <vector>
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -275,8 +279,63 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
+    // LLAMA_SPARSE_DEBUG: one-shot dump of DSA top-k gather indices (sanity:
+    // range vs cache extent, recency coverage, degenerate/duplicate patterns)
+    static const int sparse_dbg = [](){
+        const char * e = getenv("LLAMA_SPARSE_DEBUG");
+        return e ? atoi(e) : 0;
+    }();
+    int64_t sp_cmp_row = -1;
+    cudaStreamCaptureStatus sp_cs = cudaStreamCaptureStatusNone;
+    if (sparse_dbg > 0 && src1->name[0] != '\0' && strstr(src1->name, "top_k") != nullptr &&
+            cudaStreamIsCapturing(stream, &sp_cs) == cudaSuccess && sp_cs == cudaStreamCaptureStatusNone) {
+        static std::atomic<int> n_dumps{0};
+        if (n_dumps.load() < sparse_dbg) {
+            n_dumps++;
+            const int64_t n_idx = ggml_nelements(src1);
+            std::vector<int32_t> h(n_idx);
+            CUDA_CHECK(cudaMemcpyAsync(h.data(), src1->data, n_idx*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int32_t mn = INT32_MAX, mx = INT32_MIN;
+            for (int64_t i = 0; i < n_idx; i++) { mn = std::min(mn, h[i]); mx = std::max(mx, h[i]); }
+            int sp_dev = -1; cudaGetDevice(&sp_dev);
+            fprintf(stderr, "[SPDBG] dev=%d get_rows idx=%s n=%lld src0_rows=%lld dst_ne1=%lld min=%d max=%d first16:",
+                    sp_dev, src1->name, (long long) n_idx, (long long) ne01, (long long) ne11, mn, mx);
+            for (int64_t i = 0; i < std::min<int64_t>(16, n_idx); i++) { fprintf(stderr, " %d", h[i]); }
+            fprintf(stderr, " last8:");
+            for (int64_t i = std::max<int64_t>(0, n_idx-8); i < n_idx; i++) { fprintf(stderr, " %d", h[i]); }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+            sp_cmp_row = h[0]; // compare after the kernel runs
+        }
+    }
+
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+
+    // gather-vs-truth (post-kernel): dequantize cache row sp_cmp_row host-side
+    // (q8_0) and compare against the gathered dst row 0 (F32)
+    if (sp_cmp_row >= 0 && src0->type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_F32) {
+        const int64_t n_el = ne00; // full-row verification
+        std::vector<uint8_t> raw(nb01);
+        CUDA_CHECK(cudaMemcpyAsync(raw.data(), (const char *) src0->data + sp_cmp_row*nb01, nb01, cudaMemcpyDeviceToHost, stream));
+        std::vector<float> g(n_el);
+        CUDA_CHECK(cudaMemcpyAsync(g.data(), dst->data, n_el*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        float max_diff = 0.0f;
+        int64_t diff_at = -1;
+        for (int64_t i = 0; i < n_el; i++) {
+            const uint8_t * blk = raw.data() + (i/32)*34; // block_q8_0: f16 d + 32x int8
+            const float d = __half2float(*(const __half *) blk);
+            const int8_t qv = ((const int8_t *) (blk + 2))[i % 32];
+            const float diff = fabsf(d * qv - g[i]);
+            if (diff > max_diff) { max_diff = diff; diff_at = i; }
+        }
+        fprintf(stderr, "[SPCMP] row=%lld ne00=%lld nb01=%zu max_diff=%.6g at=%lld first4: %.4g %.4g %.4g %.4g\n",
+                (long long) sp_cmp_row, (long long) ne00, (size_t) nb01, max_diff, (long long) diff_at,
+                g.size() > 0 ? g[0] : 0.f, g.size() > 1 ? g[1] : 0.f, g.size() > 2 ? g[2] : 0.f, g.size() > 3 ? g[3] : 0.f);
+        fflush(stderr);
+    }
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

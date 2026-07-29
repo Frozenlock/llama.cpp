@@ -54,6 +54,40 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     int *               dst_d  = (int *) dst->data;
     cudaStream_t        stream = ctx.stream();
 
+    // LLAMA_SPARSE_DEBUG: dump DSA indexer scores around a position of interest
+    // (LLAMA_SPARSE_DEBUG_POS) + host-side top-8, for the first query row.
+    // Guarded against active stream capture (sync is illegal mid-capture).
+    static const int sp_dbg = [](){ const char * e = getenv("LLAMA_SPARSE_DEBUG"); return e ? atoi(e) : 0; }();
+    static const long sp_pos = [](){ const char * e = getenv("LLAMA_SPARSE_DEBUG_POS"); return e ? atol(e) : -1; }();
+    if (sp_dbg > 0 && src0->name[0] != '\0' && strstr(src0->name, "indexer_score") != nullptr) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) {
+            static std::atomic<int> n_dumps{0};
+            if (n_dumps.load() < sp_dbg) {
+                n_dumps++;
+                const int64_t n = src0->ne[0];
+                std::vector<float> h(n);
+                CUDA_CHECK(cudaMemcpyAsync(h.data(), src0_d, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<int64_t> ord(n);
+                for (int64_t i = 0; i < n; i++) { ord[i] = i; }
+                std::partial_sort(ord.begin(), ord.begin() + std::min<int64_t>(8, n), ord.end(),
+                        [&](int64_t a, int64_t b) { return h[a] > h[b]; });
+                int sp_dev = -1; cudaGetDevice(&sp_dev);
+                fprintf(stderr, "[SPSCORE] dev=%d %s ne0=%lld dst_ne0=%lld top8:", sp_dev, src0->name, (long long) n, (long long) dst->ne[0]);
+                for (int64_t i = 0; i < std::min<int64_t>(8, n); i++) { fprintf(stderr, " %lld:%.3g", (long long) ord[i], h[ord[i]]); }
+                if (sp_pos >= 0 && sp_pos < n) {
+                    fprintf(stderr, " | pos[%ld-2..+2]:", sp_pos);
+                    for (int64_t i = std::max<int64_t>(0, sp_pos-2); i <= std::min<int64_t>(n-1, sp_pos+2); i++) {
+                        fprintf(stderr, " %lld:%.3g", (long long) i, h[i]);
+                    }
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+    }
+
     // are these asserts truly necessary?
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_I32);

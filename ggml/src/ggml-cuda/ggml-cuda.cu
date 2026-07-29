@@ -2324,6 +2324,30 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
+            // LLAMA_SPARSE_DEBUG: one-shot FA output dump (decode graphs only,
+            // n_q==1) to numerically compare sparse-gathered vs dense paths
+            {
+                static const int sp_dbg = [](){ const char * e = getenv("LLAMA_SPARSE_FA_DEBUG"); return e ? atoi(e) : 0; }();
+                if (sp_dbg > 0 && dst->src[0]->ne[1] == 1) {
+                    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                    if (cudaStreamIsCapturing(ctx.stream(), &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) {
+                        static std::atomic<int> n_dumps{0};
+                        if (n_dumps.load() < sp_dbg) {
+                            n_dumps++;
+                            int dev = -1; cudaGetDevice(&dev);
+                            const int64_t n_el = std::min<int64_t>(ggml_nelements(dst), 8);
+                            std::vector<float> h(n_el);
+                            CUDA_CHECK(cudaMemcpyAsync(h.data(), dst->data, n_el*sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+                            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+                            fprintf(stderr, "[SPFA] dev=%d K=[%lld,%lld,%lld] Ktype=%s mask=%s first8: %.5g %.5g %.5g %.5g %.5g %.5g %.5g %.5g\n",
+                                    dev, (long long) dst->src[1]->ne[0], (long long) dst->src[1]->ne[1], (long long) dst->src[1]->ne[2],
+                                    ggml_type_name(dst->src[1]->type), dst->src[3] ? dst->src[3]->name : "none",
+                                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+                            fflush(stderr);
+                        }
+                    }
+                }
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);

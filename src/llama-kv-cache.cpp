@@ -1109,6 +1109,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    // LLAMA_SPARSE_DEBUG: apply-order visibility (DSA lid-mask lag hunt)
+    static const int sp_dbg = [](){ const char * e = getenv("LLAMA_SPARSE_DEBUG"); return e ? atoi(e) : 0; }();
+    if (sp_dbg > 0 && ubatch.n_tokens <= 2) {
+        static int n_dumps = 0;
+        if (n_dumps < sp_dbg) {
+            n_dumps++;
+            fprintf(stderr, "[SPAPPLY] head_k=%u cell=%u pos=%d n_tok=%u other=%d\n",
+                    hparams.n_embd_head_k_full, (unsigned) sinfo.idxs[0][0], (int) ubatch.pos[0],
+                    (unsigned) ubatch.n_tokens, other != nullptr ? 1 : 0);
+            fflush(stderr);
+        }
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1740,6 +1753,28 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // set_input is called unconditionally, so skip filling an unused (unallocated) mask.
     if (dst->buffer == nullptr) {
         return;
+    }
+
+    // LLAMA_SPARSE_DEBUG: cell-state visibility at mask-fill time (DSA lid-mask hunt)
+    static const int sp_dbg = [](){ const char * e = getenv("LLAMA_SPARSE_DEBUG"); return e ? atoi(e) : 0; }();
+    if (sp_dbg > 0 && ubatch->n_tokens <= 2) {
+        static int n_dumps = 0;
+        if (n_dumps < sp_dbg) {
+            n_dumps++;
+            const auto & cells = v_cells[0];
+            const llama_pos p1 = ubatch->pos[0];
+            fprintf(stderr, "[SPMASK] mask=%s ne0=%lld head_k=%u q_pos=%d cells(sz=%u):",
+                    dst->name, (long long) dst->ne[0], hparams.n_embd_head_k_full, (unsigned) cells.size(), (int) p1);
+            for (llama_pos j = std::max<llama_pos>(0, p1 - 3); j <= p1 + 1 && j < (llama_pos) cells.size(); j++) {
+                if (cells.is_empty(j)) {
+                    fprintf(stderr, " %d:EMPTY", (int) j);
+                } else {
+                    fprintf(stderr, " %d:p%d", (int) j, (int) cells.pos_get(j));
+                }
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
     }
 
     const uint32_t n_tokens = ubatch->n_tokens;

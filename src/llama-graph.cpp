@@ -2868,7 +2868,16 @@ ggml_tensor * llm_graph_context::build_attn(
     // cuts attention KV bandwidth ~n_kv/n_top_k x at long context (the actual speed win).
     // PREFILL (n_tokens>1) stays dense: the KV cache is identical, and decode attends
     // sparsely over it; per-token prefill gather would duplicate keys (BW-negative).
-    if (top_k != nullptr && n_tokens == 1 && k->ne[2] > top_k->ne[0]) {
+    // LLAMA_SPARSE_NO_GATHER: bisect knob. 1 = keep the sparse graph (indexer,
+    // top_k) but attend densely at decode (isolates gather-block bugs from
+    // selection bugs). 2 = gather ALL rows in identity order with the REAL
+    // causal mask (isolates the F32-dequantized-KV FA path from the top-k
+    // subset + zero-mask specifics).
+    static const int sparse_no_gather = [](){
+        const char * e = getenv("LLAMA_SPARSE_NO_GATHER");
+        return e ? atoi(e) : 0;
+    }();
+    if (sparse_no_gather != 1 && top_k != nullptr && n_tokens == 1 && k->ne[2] > top_k->ne[0]) {
         const int64_t n_embd_k = k->ne[0];
         const int64_t n_embd_v = v->ne[0];
         const int64_t n_kv     = k->ne[2];
@@ -2878,22 +2887,64 @@ ggml_tensor * llm_graph_context::build_attn(
         // indices [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_stream] (n_batch==1 for decode)
         ggml_tensor * idx = ggml_reshape_2d(ctx0, ggml_cont(ctx0, top_k), n_sel, n_stream);
 
+        if (sparse_no_gather == 2 || sparse_no_gather == 4) {
+            // identity gather of ALL rows; mode 2 = real mask, mode 4 = zero
+            // mask (splits mask-vs-subset suspects)
+            idx = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) n_kv, 1.0f), GGML_TYPE_I32);
+            idx = ggml_reshape_2d(ctx0, idx, n_kv, n_stream);
+        }
+        const int64_t n_out = (sparse_no_gather == 2 || sparse_no_gather == 4) ? n_kv : n_sel;
+
         // view the cache as [n_embd, n_kv, n_stream] (no copy) and gather selected rows
         ggml_tensor * k_src = ggml_view_3d(ctx0, k, n_embd_k, n_kv, n_stream, k->nb[2], k->nb[3], 0);
         ggml_tensor * v_src = ggml_view_3d(ctx0, k, n_embd_v, n_kv, n_stream, k->nb[2], k->nb[3], 0);
-        ggml_tensor * k_g = ggml_get_rows(ctx0, k_src, idx);  // [n_embd_k, n_sel, n_stream]
-        ggml_tensor * v_g = ggml_get_rows(ctx0, v_src, idx);  // [n_embd_v, n_sel, n_stream]
-        k_g = ggml_reshape_4d(ctx0, k_g, n_embd_k, 1, n_sel, n_stream);
-        v_g = ggml_reshape_4d(ctx0, v_g, n_embd_v, 1, n_sel, n_stream);
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_src, idx);  // [n_embd_k, n_out, n_stream]
+        ggml_tensor * v_g = ggml_get_rows(ctx0, v_src, idx);  // [n_embd_v, n_out, n_stream]
+        k_g = ggml_reshape_4d(ctx0, k_g, n_embd_k, 1, n_out, n_stream);
+        v_g = ggml_reshape_4d(ctx0, v_g, n_embd_v, 1, n_out, n_stream);
 
         // All gathered keys are causally valid (the indexer selects only past positions),
         // so the attention mask over them is all-zeros. Build a fresh F16 zero mask sized
         // [n_sel, n_q_pad, 1, n_stream] using the original mask's query-padding/stream dims.
         // (The full causal kq_mask is unused on this path; see set_input_kq_mask guard.)
         GGML_UNUSED(n_stream);
-        ggml_tensor * m_g = ggml_fill(ctx0,
-            ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_sel, kq_mask->ne[1], 1, kq_mask->ne[3]),
-            0.0f);
+        if (sparse_no_gather == 6) {
+            // dense K/V (q8_0, proven FA path) + mask restricted to the selected
+            // positions: -inf base with zeros scattered at idx. Math-identical
+            // softmax set to the gather path, zero shared code with it.
+            ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_sel), 0.0f);
+            ggml_tensor * minf  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_kv), -INFINITY);
+            ggml_tensor * mrow  = ggml_set_rows(ctx0, minf, zeros, idx); // [1, n_kv], 0 at idx
+            ggml_tensor * mres  = ggml_reshape_4d(ctx0, mrow, n_kv, 1, 1, 1);
+            ggml_tensor * mrep  = ggml_repeat_4d(ctx0, mres, n_kv, kq_mask->ne[1], 1, kq_mask->ne[3]);
+            ggml_tensor * m6    = ggml_cast(ctx0, mrep, GGML_TYPE_F16);
+            cur = build_attn_mha(q, k, v, kq_b, m6, sinks, v_mla, kq_scale, il);
+            cb(cur, "kqv_out", il);
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+            }
+            return cur;
+        }
+
+        ggml_tensor * m_g;
+        if (sparse_no_gather == 2) {
+            m_g = kq_mask;
+        } else if (sparse_no_gather == 5) {
+            // real mask values gathered for the selected columns: transpose the
+            // mask so positions become rows, gather with the same idx, transpose
+            // back; cast to F16 for FA (get_rows dequantizes to F32)
+            ggml_tensor * mt = ggml_cont(ctx0, ggml_transpose(ctx0, kq_mask)); // [n_q_pad, n_kv]
+            ggml_tensor * mg = ggml_get_rows(ctx0, mt, idx);                   // [n_q_pad, n_out] F32
+            mg = ggml_cont(ctx0, ggml_transpose(ctx0, mg));                    // [n_out, n_q_pad]
+            m_g = ggml_cast(ctx0, mg, GGML_TYPE_F16);
+        } else {
+            m_g = ggml_fill(ctx0,
+                ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_out, kq_mask->ne[1], 1, kq_mask->ne[3]),
+                0.0f);
+        }
 
         cur = build_attn_mha(q, k_g, v_g, kq_b, m_g, sinks, v_mla, kq_scale, il);
     } else {
