@@ -1481,6 +1481,43 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         return;
     }
 
+    // Row-ranged access to a single-segment axis-1 split of an effectively-2D
+    // tensor: the position-sharded KV cache, where member j owns the global
+    // row range [base_j, base_j + ne_j) in member order (rotation pinned 0).
+    // llama state save/load (--cache-ram / --slot-save-path) writes
+    // per-sequence CELL RANGES, which the whole-tensor chunk splice below
+    // asserts against. Ownership comes from the PARENT cache's split state:
+    // a view's own split state distributes rows proportionally (S1 lesson).
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+            tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+            offset % tensor->nb[1] == 0 && size % tensor->nb[1] == 0 &&
+            !(offset == 0 && size == ggml_nbytes(tensor))) {
+        const ggml_tensor * root = tensor->view_src != nullptr ? tensor->view_src : tensor;
+        const ggml_backend_meta_split_state rss = ggml_backend_meta_get_split_state(root, /*assume_sync =*/ false);
+        if (rss.axis == GGML_BACKEND_SPLIT_AXIS_1 && rss.n_segments == 1 && root->ne[1] == tensor->ne[1]) {
+            const size_t  row_size  = tensor->nb[1];
+            const int64_t row_start = (int64_t) (offset / row_size);
+            const int64_t row_count = (int64_t) (size / row_size);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            size_t  data_off = 0;
+            int64_t base_j   = 0;
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const int64_t ne_j  = rss.ne[j];
+                const int64_t r_beg = std::max<int64_t>(row_start, base_j);
+                const int64_t r_end = std::min<int64_t>(row_start + row_count, base_j + ne_j);
+                if (r_beg < r_end && simple_tensor != nullptr) {
+                    ggml_backend_tensor_set(simple_tensor, (const char *) data + data_off,
+                        (size_t) (r_beg - base_j) * row_size, (size_t) (r_end - r_beg) * row_size);
+                    data_off += (size_t) (r_end - r_beg) * row_size;
+                }
+                base_j += ne_j;
+            }
+            GGML_ASSERT(data_off == size);
+            return;
+        }
+    }
+
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
@@ -1593,6 +1630,38 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         }
         GGML_ASSERT(offset_data*row_count == size);
         return;
+    }
+
+    // Row-ranged access to a single-segment axis-1 split (position-sharded KV
+    // cache) — mirror of the set_tensor fast path; see comment there.
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+            tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+            offset % tensor->nb[1] == 0 && size % tensor->nb[1] == 0 &&
+            !(offset == 0 && size == ggml_nbytes(tensor))) {
+        const ggml_tensor * root = tensor->view_src != nullptr ? tensor->view_src : tensor;
+        const ggml_backend_meta_split_state rss = ggml_backend_meta_get_split_state(root, /*assume_sync =*/ false);
+        if (rss.axis == GGML_BACKEND_SPLIT_AXIS_1 && rss.n_segments == 1 && root->ne[1] == tensor->ne[1]) {
+            const size_t  row_size  = tensor->nb[1];
+            const int64_t row_start = (int64_t) (offset / row_size);
+            const int64_t row_count = (int64_t) (size / row_size);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            size_t  data_off = 0;
+            int64_t base_j   = 0;
+            for (size_t j = 0; j < n_bufs; j++) {
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const int64_t ne_j  = rss.ne[j];
+                const int64_t r_beg = std::max<int64_t>(row_start, base_j);
+                const int64_t r_end = std::min<int64_t>(row_start + row_count, base_j + ne_j);
+                if (r_beg < r_end && simple_tensor != nullptr) {
+                    ggml_backend_tensor_get(simple_tensor, (char *) data + data_off,
+                        (size_t) (r_beg - base_j) * row_size, (size_t) (r_end - r_beg) * row_size);
+                    data_off += (size_t) (r_end - r_beg) * row_size;
+                }
+                base_j += ne_j;
+            }
+            GGML_ASSERT(data_off == size);
+            return;
+        }
     }
 
     switch (split_state.axis) {
