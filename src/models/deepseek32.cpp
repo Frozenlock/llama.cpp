@@ -202,6 +202,22 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // GLM-5.2 IndexShare: only a subset of layers ("full" layers) have a
+    // TRAINED lightning indexer; the rest were trained REUSING the nearest
+    // preceding full layer's top-k selection, and their own indexer weights
+    // produce near-uniform noise (measured: full layers peak at scores
+    // 20-105, shared layers ~0.2-7 with arbitrary argmax). Computing per-layer
+    // selections on shared layers picks ~arbitrary 2048-token subsets and
+    // breaks generation. Full-layer lattice measured on GLM-5.2: {0, 1} then
+    // every 4th layer from 6 through 70. deepseek32 proper keeps per-layer
+    // indexers (all trained). LLAMA_GLM_INDEX_SHARE=0 disables (bisect).
+    static const bool glm_index_share = [](){
+        const char * e = getenv("LLAMA_GLM_INDEX_SHARE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool is_glm_dsa = model.arch == LLM_ARCH_GLM_DSA;
+    ggml_tensor * top_k_shared = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -219,8 +235,11 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
             ggml_tensor * top_k = nullptr;
 
+            const bool indexer_full_layer = !(glm_index_share && is_glm_dsa) ||
+                il <= 1 || (il >= 6 && il <= 70 && (il - 6) % 4 == 0);
+
             // lightning indexer
-            {
+            if (indexer_full_layer) {
                 ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
                 cb(indexer_q, "indexer_q", il);
 
@@ -354,6 +373,11 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
                 top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
                 cb(top_k, "top_k", il);
+
+                top_k_shared = top_k;
+            } else {
+                // shared layer: reuse the nearest preceding full layer's selection
+                top_k = top_k_shared;
             }
 
             ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);
