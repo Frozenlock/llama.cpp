@@ -452,10 +452,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 #else
+        // S2b partial-attention decode (LLAMA_KV_SHARD_S2B): every member must
+        // hold ALL query heads so each can attend over its own KV position
+        // shard (partials merged via log-sum-exp) - mirror wq_b and the k_b
+        // absorb matrix. wv_b stays head-split: the combine output is
+        // mirrored, so per-member v_mla decompression of its own heads feeds
+        // the row-split wo like today.
+        static const bool kv_shard_s2b = [](){
+            const char * e = getenv("LLAMA_KV_SHARD_S2B");
+            return e != nullptr && atoi(e) != 0;
+        }();
         if (std::regex_match(tensor_name, pattern_mla_q_b)) {
+            if (kv_shard && kv_shard_s2b) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_mla_kv_b)) {
+            if (kv_shard && kv_shard_s2b && tensor_name.find("attn_k_b") != std::string::npos) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             // 3D tensors {*, *, n_head}: split on the head axis
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
         }
