@@ -2856,14 +2856,18 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask_mla();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);   // [n_embd_k, 1, n_kv, n_stream]
+    ggml_tensor * k_raw = mctx_cur->get_k(ctx0, il);   // [n_embd_k, 1, n_kv, n_stream]
+    ggml_tensor * k = k_raw;
 
     // LLAMA_KV_SHARD: the MLA latent cache is position-sharded across the TP
-    // pair; gather the halves into a mirrored full-size tensor at a meta
-    // gather boundary before attention (same as the dense MLA overload). The
-    // lid (indexer) cache stays mirrored, so selection needs no gather; the
-    // sparse get_rows below then indexes the gathered full KV with global
-    // positions, which is correct by construction.
+    // pair; for DENSE attention (prefill), gather the halves into a mirrored
+    // full-size tensor at a meta gather boundary. The SPARSE decode path below
+    // instead gathers the selected rows directly from the RAW sharded cache:
+    // each member fetches only the rows it owns (zero-filling the rest, meta
+    // rebases indices via op_params) and the PARTIAL result is completed by
+    // the standard allreduce - ~n_sel*row_bytes on the wire instead of the
+    // whole cache. The lid (indexer) cache is mirrored, so selection needs no
+    // gather and is member-identical.
     static const bool kv_shard_dsa = [] {
         const char * e = getenv("LLAMA_KV_SHARD");
         return e != nullptr && atoi(e) != 0;
@@ -2911,13 +2915,19 @@ ggml_tensor * llm_graph_context::build_attn(
         }
         const int64_t n_out = (sparse_no_gather == 2 || sparse_no_gather == 4) ? n_kv : n_sel;
 
-        // view the cache as [n_embd, n_kv, n_stream] (no copy) and gather selected rows
-        ggml_tensor * k_src = ggml_view_3d(ctx0, k, n_embd_k, n_kv, n_stream, k->nb[2], k->nb[3], 0);
-        ggml_tensor * v_src = ggml_view_3d(ctx0, k, n_embd_v, n_kv, n_stream, k->nb[2], k->nb[3], 0);
-        ggml_tensor * k_g = ggml_get_rows(ctx0, k_src, idx);  // [n_embd_k, n_out, n_stream]
-        ggml_tensor * v_g = ggml_get_rows(ctx0, v_src, idx);  // [n_embd_v, n_out, n_stream]
+        // view the cache as [n_embd, n_kv, n_stream] (no copy) and gather selected
+        // rows. Under kv_shard, source the RAW sharded cache: the gathered cont is
+        // then dead code in sparse decode graphs (pruned - no whole-KV gather).
+        ggml_tensor * k_base = kv_shard_dsa ? k_raw : k;
+        ggml_tensor * k_src = ggml_view_3d(ctx0, k_base, n_embd_k, n_kv, n_stream, k_base->nb[2], k_base->nb[3], 0);
+        // Gather ONCE (full-width rows) and take V as a strided view of the
+        // gathered K (V is a row prefix, same as the dense path). Under
+        // kv_shard this keeps a SINGLE partial node -> a single allreduce
+        // completes both K and V (the reduce runs on one boundary node only).
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_src, idx);  // [n_embd_k, n_out, n_stream] F32
         k_g = ggml_reshape_4d(ctx0, k_g, n_embd_k, 1, n_out, n_stream);
-        v_g = ggml_reshape_4d(ctx0, v_g, n_embd_v, 1, n_out, n_stream);
+        ggml_tensor * v_g = ggml_view_4d(ctx0, k_g, n_embd_v, 1, n_out, n_stream,
+            k_g->nb[1], k_g->nb[2], k_g->nb[3], 0);
 
         // All gathered keys are causally valid (the indexer selects only past positions),
         // so the attention mask over them is all-zeros. Build a fresh F16 zero mask sized

@@ -822,6 +822,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_im
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // Position-sharded sparse gather (LLAMA_KV_SHARD + DSA decode): rows
+        // distributed on axis 1, indices are mirrored GLOBAL positions. Each
+        // member gathers only the rows it owns (the CUDA kernel rebases via
+        // op_params and ZERO-FILLS foreign rows), so the member-sum is the
+        // complete gather -> PARTIAL; the standard allreduce completes it.
+        // ~n_sel*row_bytes moved per boundary instead of the whole cache.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
@@ -2432,6 +2441,35 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             inject_logged++;
                             fprintf(stderr, "[KVSBASE] inject member=%zu node=%s base=%lld ptr=%p\n",
                                     j, node->name, (long long) base_j, (void *) bcj.nodes[i]);
+                        }
+                    }
+                }
+
+                // KV-shard sparse gather rebase: a GET_ROWS whose source is an
+                // axis1-sharded cache receives GLOBAL row ids. Encode member
+                // base in op_params[0] and set op_params[1]=1 ("shard mode"):
+                // the CUDA kernel rebases and ZERO-FILLS out-of-shard rows, so
+                // the PARTIAL member results sum to the complete gather.
+                if (node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr) {
+                    ggml_tensor * src_root = node->src[0]->view_src != nullptr ? node->src[0]->view_src : node->src[0];
+                    const ggml_backend_meta_split_state gss = ggml_backend_meta_get_split_state(src_root, /*assume_sync =*/ false);
+                    if (gss.axis == GGML_BACKEND_SPLIT_AXIS_1 && gss.n_segments == 1) {
+                        int64_t base_j = 0;
+                        for (size_t jj = 0; jj < j; jj++) {
+                            base_j += gss.ne[jj];
+                        }
+                        GGML_ASSERT(base_j <= INT32_MAX);
+                        ggml_set_op_params_i32(bcj.nodes[i], 0, (int32_t) base_j);
+                        ggml_set_op_params_i32(bcj.nodes[i], 1, 1);
+                        // member OWNED extent from the PARENT cache split (a
+                        // view's own ne distributes rows proportionally and is
+                        // WRONG for ownership -- the S1 lesson)
+                        ggml_set_op_params_i32(bcj.nodes[i], 2, (int32_t) gss.ne[j]);
+                        static int gr_logged = 0;
+                        if (gr_logged < 4) {
+                            gr_logged++;
+                            fprintf(stderr, "[KVSGROWS] inject member=%zu node=%s base=%lld\n",
+                                    j, node->name, (long long) base_j);
                         }
                     }
                 }

@@ -13,7 +13,8 @@ static __global__ void k_get_rows(
         /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
         /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
+        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/,
+        const int64_t shard_base, const int64_t shard_rows) {
 
     ggml_cuda_pdl_sync();
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
@@ -24,15 +25,28 @@ static __global__ void k_get_rows(
             const int i11 =  dm.x;
             const int i12 =  dm.y;
 
-            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
-
-            dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
-            const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+            int64_t i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
             const int ib   =  i00/qk;      // block index
             const int iqs  = (i00%qk)/qr;  // quant index
             const int iybs = i00 - i00%qk; // dst block start index
             const int y_offset = qr == 1 ? 1 : qk/2;
+
+            dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+            // position-sharded gather: rebase global row id to this member's
+            // shard; foreign rows are ZERO-FILLED so the member-sum (allreduce)
+            // reconstructs the complete gather
+            if (shard_rows > 0) {
+                i01 -= shard_base;
+                if (i01 < 0 || i01 >= shard_rows) {
+                    dst_row[iybs + iqs + 0]        = ggml_cuda_cast<dst_t>(0.0f);
+                    dst_row[iybs + iqs + y_offset] = ggml_cuda_cast<dst_t>(0.0f);
+                    continue;
+                }
+            }
+
+            const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
             // dequantize
             float2 v;
@@ -51,7 +65,8 @@ static __global__ void k_get_rows_float(
         /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
         /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
+        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/,
+        const int64_t shard_base, const int64_t shard_rows) {
 
     ggml_cuda_pdl_lc();
     const src0_t  * GGML_CUDA_RESTRICT src0 = src0_ptr;
@@ -70,9 +85,18 @@ static __global__ void k_get_rows_float(
                 return;
             }
 
-            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+            int64_t i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
             dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+            if (shard_rows > 0) {
+                i01 -= shard_base;
+                if (i01 < 0 || i01 >= shard_rows) {
+                    dst_row[i00] = ggml_cuda_cast<dst_t>(0.0f);
+                    continue;
+                }
+            }
+
             const src0_t * src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
             dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
@@ -113,7 +137,7 @@ static void get_rows_cuda_q(
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const int64_t shard_base = 0, const int64_t shard_rows = 0) {
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const int block_num_y = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1) / (2*CUDA_GET_ROWS_BLOCK_SIZE);
     const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
@@ -141,7 +165,8 @@ static void get_rows_cuda_q(
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
         /* s0,*/ s1, s2, s3,
         /* nb00,*/ nb01, nb02, nb03,
-        s10, s11, s12/*, s13*/);
+        s10, s11, s12/*, s13*/,
+        shard_base, shard_rows);
 }
 
 template<typename src0_t, typename dst_t>
@@ -150,7 +175,7 @@ static void get_rows_cuda_float(
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const int64_t shard_base = 0, const int64_t shard_rows = 0) {
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
     const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
@@ -177,7 +202,8 @@ static void get_rows_cuda_float(
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
         /* s0,*/ s1, s2, s3,
         /* nb00,*/ nb01, nb02, nb03,
-        s10, s11, s12/*, s13*/);
+        s10, s11, s12/*, s13*/,
+        shard_base, shard_rows);
 }
 
 template <typename dst_t>
@@ -186,47 +212,47 @@ static void ggml_cuda_get_rows_switch_src0_type(
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const int64_t shard_base = 0, const int64_t shard_rows = 0) {
     switch (src0_type) {
         case GGML_TYPE_F16:
             get_rows_cuda_float((const half *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_F32:
             get_rows_cuda_float((const float *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_I32:
             get_rows_cuda_float((const int32_t *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_BF16:
             get_rows_cuda_float((const nv_bfloat16 *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_Q1_0:
             get_rows_cuda_q<QK1_0, QR1_0, dequantize_q1_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_Q4_0:
             get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_Q4_1:
             get_rows_cuda_q<QK4_1, QR4_1, dequantize_q4_1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_Q5_0:
             get_rows_cuda_q<QK5_0, QR5_0, dequantize_q5_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_Q5_1:
             get_rows_cuda_q<QK5_1, QR5_1, dequantize_q5_1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_Q8_0:
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         default:
             // TODO: k-quants
@@ -240,23 +266,23 @@ void get_rows_cuda(
         int64_t ne00, size_t nb01, size_t nb02, size_t nb03,
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, int64_t shard_base, int64_t shard_rows) {
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_I32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (int32_t *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_F16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (half *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         case GGML_TYPE_BF16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (nv_bfloat16 *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, shard_base, shard_rows);
             break;
         default:
             GGML_ABORT("%s: unsupported dst type: %s\n", __func__, ggml_type_name(dst_type));
@@ -310,8 +336,16 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
+    // KV-shard sparse gather (meta-injected op_params): [0]=member row base,
+    // [1]=shard mode flag; rebase + zero-fill foreign rows (see meta backend)
+    const int32_t sh_mode = ((const int32_t *) dst->op_params)[1];
+    const int64_t sh_base = sh_mode != 0 ? ((const int32_t *) dst->op_params)[0] : 0;
+    // owned extent comes from op_params (parent-cache split), NOT the view's
+    // proportionally-distributed ne01
+    const int64_t sh_rows = sh_mode != 0 ? ((const int32_t *) dst->op_params)[2] : 0;
+
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
-        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, sh_base, sh_rows);
 
     // gather-vs-truth (post-kernel): dequantize cache row sp_cmp_row host-side
     // (q8_0) and compare against the gathered dst row 0 (F32)
