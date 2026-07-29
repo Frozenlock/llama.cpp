@@ -3010,11 +3010,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (stage_graph) {
         // prefill passes only: capture+instantiate overhead (~10ms/stage) is
         // amortized over large ubatches, not per decode token. Detect prefill
-        // by batch width — decode/verify passes stay <= ~16 tokens.
+        // by batch width — decode/verify passes stay <= ~16 tokens. Width is
+        // read from MATMUL nodes only: their ne[1] is the true token count,
+        // while cache writes (SET_ROWS dst = whole cache) and kq masks (query
+        // dim padded to 64) carry large ne[1] and misclassified GLM-DSA spec
+        // verify batches (T<=8) as prefill — ~500 stage captures PER DECODE
+        // STEP, tripling verify cost (measured 170ms vs 62ms/step at 8.5K).
         int64_t max_batch = 0;
         const int n_scan = std::min(cgraph->n_nodes, 48);
         for (int k = 0; k < n_scan; k++) {
-            max_batch = std::max(max_batch, cgraph->nodes[k]->ne[1]);
+            const ggml_tensor * nk = cgraph->nodes[k];
+            if (nk->op != GGML_OP_MUL_MAT && nk->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            max_batch = std::max(max_batch, nk->ne[1]);
         }
         stage_graph = max_batch >= 64;
     }
