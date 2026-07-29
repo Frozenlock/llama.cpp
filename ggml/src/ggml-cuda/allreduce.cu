@@ -426,7 +426,23 @@ static __global__ void ggml_cuda_ar_flat_kernel(
 // ---------------------------------------------------------------------------
 
 static constexpr int    GGML_CUDA_AR_GRAPH_SLOTS      = 2;
-static constexpr size_t GGML_CUDA_AR_GRAPH_SLOT_BYTES = 256 * 1024; // max wire bytes per AR in captured graphs
+// max wire bytes per AR in captured graphs. Default raised to 2 MiB for the
+// S2b partial-attention exchange ([DV+2]*n_head*T*2 slots F32: ~1.6 MiB at
+// T=4); host-mapped wire at these sizes is ~100-200us. GGML_CUDA_AR_GRAPH_SLOT_KB
+// overrides (the meta outer-capture admission check reads this same value via
+// ggml_cuda_ar_graph_slot_bytes()).
+static size_t ggml_cuda_ar_graph_slot_bytes_impl() {
+    static const size_t v = [](){
+        const char * e = getenv("GGML_CUDA_AR_GRAPH_SLOT_KB");
+        const long kb = e ? atol(e) : 2048;
+        return (size_t) (kb > 0 ? kb : 2048) * 1024;
+    }();
+    return v;
+}
+extern "C" size_t ggml_cuda_ar_graph_slot_bytes(void) {
+    return ggml_cuda_ar_graph_slot_bytes_impl();
+}
+#define GGML_CUDA_AR_GRAPH_SLOT_BYTES ggml_cuda_ar_graph_slot_bytes_impl()
 
 template <typename T_wire>
 struct ggml_cuda_ar_graph_args {

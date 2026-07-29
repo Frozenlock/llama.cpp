@@ -2896,6 +2896,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    static const auto ggml_backend_meta_ar_graph_slot_bytes = [](){
+        static const size_t v = [](){
+            const char * e = getenv("GGML_CUDA_AR_GRAPH_SLOT_KB");
+            const long kb = e ? atol(e) : 2048;
+            return (size_t) (kb > 0 ? kb : 2048) * 1024;
+        }();
+        return v;
+    };
+
     static const bool tp_spike_dump   = getenv("TP_SPIKE_DUMP") != nullptr;
     static const bool tp_spike_timing = getenv("TP_SPIKE_TIMING") != nullptr;
     // TP_SUBMIT_TIMING: like TP_SPIKE_TIMING but WITHOUT the end sync - shows
@@ -2947,11 +2956,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             og = &backend_ctx->outer_graphs.back();
             og->uid = cgraph->uid;
             // Capturability: every boundary (PARTIAL) node must fit the
-            // graph-mode AR staging slot (256 KB), sized for decode/verify.
+            // graph-mode AR staging slot, sized for decode/verify (incl. the
+            // S2b partial-attention exchange).
             auto & bc0 = backend_ctx->backend_configs[0];
             for (size_t i = 0; i + 1 < backend_ctx->n_subgraphs && og->capturable; i++) {
                 ggml_cgraph * cg = bc0.cgraphs[i].cgraph_main;
-                if (cg->n_nodes < 1 || ggml_nbytes(cg->nodes[cg->n_nodes - 1]) > 256 * 1024) {
+                if (cg->n_nodes < 1 || ggml_nbytes(cg->nodes[cg->n_nodes - 1]) > ggml_backend_meta_ar_graph_slot_bytes()) {
                     og->capturable = false;
                 }
                 // gather boundaries (position-sharded KV) host-synchronize
