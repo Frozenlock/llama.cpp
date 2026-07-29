@@ -498,6 +498,25 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+// GLM-DSA sparse runs a dual (mla+lid) cache context; graph builders that only
+// know the plain MLA cache (the MTP nextn draft graph) must see the MLA
+// sub-context. No-op for every other memory type.
+static const llama_kv_cache_context * llama_graph_mla_ctx(const llama_memory_context_i * mctx) {
+    if (const auto * dsa = dynamic_cast<const llama_kv_cache_dsa_context *>(mctx)) {
+        return dsa->get_mla();
+    }
+    return static_cast<const llama_kv_cache_context *>(mctx);
+}
+
+// spec-decode small-batch sparse gather width (see the DSA build_attn overload)
+static int llama_sparse_spec_ntok() {
+    static const int v = [](){
+        const char * e = getenv("LLAMA_SPARSE_SPEC_NTOK");
+        return e ? atoi(e) : 8;
+    }();
+    return v;
+}
+
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
@@ -505,7 +524,7 @@ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    const auto * mctx = llama_graph_mla_ctx(params.mctx);
 
     this->mctx = mctx;
 
@@ -528,6 +547,23 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
     mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
 
     mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
+
+    // spec-decode block mask: query t attends only its own gathered top-k
+    // block [t*n_sel, (t+1)*n_sel); padded query rows stay -inf (matches the
+    // dense mask's padding semantics). Unallocated when the graph does not
+    // take the small-batch gather branch.
+    if (self_kq_mask_spec != nullptr && self_kq_mask_spec->buffer != nullptr) {
+        const int64_t n_out  = self_kq_mask_spec->ne[0];
+        const int64_t n_qpad = self_kq_mask_spec->ne[1];
+        const int64_t n_tok  = std::max<int64_t>(ubatch->n_tokens, 1);
+        const int64_t n_sel  = n_out / n_tok;
+        // F16: 0x0000 = 0.0, 0xFC00 = -inf
+        std::vector<uint16_t> m((size_t) (n_out * n_qpad), 0xFC00);
+        for (int64_t t = 0; t < n_tok && t < n_qpad; ++t) {
+            std::fill_n(m.data() + t*n_out + t*n_sel, (size_t) n_sel, (uint16_t) 0);
+        }
+        ggml_backend_tensor_set(self_kq_mask_spec, m.data(), 0, m.size()*sizeof(uint16_t));
+    }
 }
 
 bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
@@ -2745,7 +2781,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 }
 
 llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
-    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+    const auto * mctx_cur = llama_graph_mla_ctx(mctx);
 
     auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
@@ -2897,14 +2933,21 @@ ggml_tensor * llm_graph_context::build_attn(
         const char * e = getenv("LLAMA_SPARSE_NO_GATHER");
         return e ? atoi(e) : 0;
     }();
-    if (sparse_no_gather != 1 && top_k != nullptr && n_tokens == 1 && k->ne[2] > top_k->ne[0]) {
+    // single-token decode always; small multi-token batches (MTP / ngram
+    // verify, n_tokens <= LLAMA_SPARSE_SPEC_NTOK) gather every query's top-k
+    // back-to-back and restrict each query to its own block with the
+    // block-diagonal spec mask (one gather + one FA call, no dedup).
+    const bool sparse_small_batch = n_tokens == 1 ||
+        (n_tokens <= (int64_t) llama_sparse_spec_ntok() && sparse_no_gather == 0 &&
+         k->ne[3] == 1 && inp->get_kq_mask_spec() != nullptr);
+    if (sparse_no_gather != 1 && top_k != nullptr && sparse_small_batch && k->ne[2] > top_k->ne[0]) {
         const int64_t n_embd_k = k->ne[0];
         const int64_t n_embd_v = v->ne[0];
         const int64_t n_kv     = k->ne[2];
         const int64_t n_stream = k->ne[3];
-        const int64_t n_sel    = top_k->ne[0];
+        const int64_t n_sel    = top_k->ne[0] * n_tokens; // per-query blocks, flattened
 
-        // indices [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_stream] (n_batch==1 for decode)
+        // indices [n_top_k, n_tokens, 1, n_stream] -> [n_top_k*n_tokens, n_stream]
         ggml_tensor * idx = ggml_reshape_2d(ctx0, ggml_cont(ctx0, top_k), n_sel, n_stream);
 
         if (sparse_no_gather == 2 || sparse_no_gather == 4) {
@@ -2956,7 +2999,10 @@ ggml_tensor * llm_graph_context::build_attn(
         }
 
         ggml_tensor * m_g;
-        if (sparse_no_gather == 2) {
+        if (n_tokens > 1) {
+            // block-diagonal spec mask (host-filled input; see set_input)
+            m_g = inp->get_kq_mask_spec();
+        } else if (sparse_no_gather == 2) {
             m_g = kq_mask;
         } else if (sparse_no_gather == 5) {
             // real mask values gathered for the selected columns: transpose the
@@ -3159,6 +3205,18 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
         inp->self_kq_mask_lid_cnv = inp->self_kq_mask_lid;
 
         inp->self_k_rot_lid = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+    }
+
+    // spec-decode small-batch sparse gather: block-diagonal mask input, sized
+    // [n_tokens*top_k, n_q_pad]. Only for small multi-token batches (MTP /
+    // ngram verify); single-token decode keeps the zero-fill mask and prefill
+    // stays dense.
+    if (n_tokens > 1 && n_tokens <= (int64_t) llama_sparse_spec_ntok() &&
+            hparams.indexer_top_k > 0 && inp->self_kq_mask_mla->ne[3] == 1) {
+        inp->self_kq_mask_spec = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16,
+                (int64_t) hparams.indexer_top_k * n_tokens, inp->self_kq_mask_mla->ne[1], 1, 1);
+        ggml_set_input(inp->self_kq_mask_spec);
+        ggml_format_name(inp->self_kq_mask_spec, "kq_mask_spec");
     }
 
     return (llm_graph_input_attn_k_dsa *) res->add_input(std::move(inp));

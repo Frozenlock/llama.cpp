@@ -408,6 +408,7 @@ public:
 
     ggml_tensor * get_kq_mask_mla() const { return self_kq_mask_mla_cnv; }
     ggml_tensor * get_kq_mask_lid() const { return self_kq_mask_lid; }
+    ggml_tensor * get_kq_mask_spec() const { return self_kq_mask_spec; }
 
     ggml_tensor * self_k_idxs_mla = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_lid = nullptr; // I64 [n_batch]
@@ -416,6 +417,11 @@ public:
     ggml_tensor * self_kq_mask_mla_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_lid     = nullptr; // F32     [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_lid_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // spec-decode small-batch sparse gather (1 < n_tokens <= LLAMA_SPARSE_SPEC_NTOK):
+    // block-diagonal F16 mask [n_tokens*top_k, n_q_pad, 1, 1] - query t attends only
+    // its own gathered top-k block; filled host-side in set_input
+    ggml_tensor * self_kq_mask_spec = nullptr;
 
     ggml_tensor * self_k_rot_lid = nullptr;
 

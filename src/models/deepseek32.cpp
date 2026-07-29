@@ -219,6 +219,12 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
         const char * e = getenv("LLAMA_SPARSE_PREFILL_TOPK");
         return e != nullptr && atoi(e) != 0;
     }();
+    // spec-decode small-batch gather threshold - must match the DSA
+    // build_attn gate in llama-graph.cpp (MTP / ngram verify batches)
+    static const int sparse_spec_ntok = [](){
+        const char * e = getenv("LLAMA_SPARSE_SPEC_NTOK");
+        return e ? atoi(e) : 8;
+    }();
     const bool is_glm_dsa = model.arch == LLM_ARCH_GLM_DSA;
     ggml_tensor * top_k_shared = nullptr;
 
@@ -242,13 +248,14 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
             const bool indexer_full_layer = !(glm_index_share && is_glm_dsa) ||
                 il <= 1 || (il >= 6 && il <= 70 && (il - 6) % 4 == 0);
 
-            // The top-k selection is consumed by build_attn only at single-token
-            // decode; at prefill attention runs dense and the selection is
-            // discarded, so only the indexer key cache is filled (later decode
-            // selection reads it) and the O(n^2) score matrix + top-k argsort
-            // are skipped. LLAMA_SPARSE_PREFILL_TOPK=1 restores the full
-            // computation on every batch.
-            const bool need_topk = n_tokens == 1 || sparse_prefill_topk;
+            // The top-k selection is consumed by build_attn at single-token
+            // decode and for small spec-decode verify batches (MTP / ngram,
+            // n_tokens <= sparse_spec_ntok); at prefill attention runs dense
+            // and the selection is discarded, so only the indexer key cache is
+            // filled (later decode selection reads it) and the O(n^2) score
+            // matrix + top-k argsort are skipped. LLAMA_SPARSE_PREFILL_TOPK=1
+            // restores the full computation on every batch.
+            const bool need_topk = n_tokens <= sparse_spec_ntok || sparse_prefill_topk;
 
             // lightning indexer
             if (indexer_full_layer) {
@@ -474,7 +481,11 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                         Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        // MTP needs the full-width post-norm hidden state (t_h_nextn below):
+        // defer the last-layer output-row slice exactly like deepseek2 does
+        static const bool mtp_slice_last = getenv("LLAMA_MTP_SLICE_LAST") != nullptr;
+        if (il == n_layer - 1 && inp_out_ids &&
+                (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked || mtp_slice_last)) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -536,6 +547,19 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+
+    // MTP (draft-mtp) feeds on the target's post-output-norm hidden state; the
+    // dense GLM-DSA builder (deepseek2) publishes it, and without it the draft
+    // head runs on garbage (measured: draft acceptance 0.2-1% vs 29-88% dense).
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    {
+        static const bool mtp_slice_last2 = getenv("LLAMA_MTP_SLICE_LAST") != nullptr;
+        if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids && !mtp_slice_last2) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
