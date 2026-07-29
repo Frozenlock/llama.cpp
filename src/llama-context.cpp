@@ -299,14 +299,13 @@ llama_context::llama_context(
     cparams.auto_flid    = true;
 
     // LLAMA_GLM_SPARSE: activate the (otherwise dead) GLM-DSA sparse attention path.
-    // The fused lightning-indexer op is NOT supported by the TP meta-backend
-    // (GGML_OP_LIGHTNING_INDEXER aborts in get_split_state), so force the unfused
-    // indexer path and skip the auto-probe (which would run the fused op and abort).
-    if (const char * e = getenv("LLAMA_GLM_SPARSE")) {
-        if (atoi(e) != 0) {
-            cparams.fused_lid = false;
-            cparams.auto_flid = false;
-        }
+    // The meta backend now mirrors GGML_OP_LIGHTNING_INDEXER (all inputs are
+    // member-identical: mirrored lid cache + mirrored indexer weights), so the
+    // fused indexer is allowed under TP. LLAMA_GLM_FUSED_LID=0 forces the
+    // unfused chain (bisect fallback).
+    if (const char * e = getenv("LLAMA_GLM_FUSED_LID"); e && atoi(e) == 0) {
+        cparams.fused_lid = false;
+        cparams.auto_flid = false;
     }
 
     cparams.fused_dsv4_hc_pre  = true;

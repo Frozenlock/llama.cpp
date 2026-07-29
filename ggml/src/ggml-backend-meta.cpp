@@ -1109,6 +1109,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_im
                 // full tensor -> mirrored
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
+            case GGML_OP_LIGHTNING_INDEXER: {
+                // DSA fused indexer: with the lid cache mirrored (kv_shard) and
+                // the indexer weights mirrored, every input is member-identical
+                // -> both members compute the identical full score tensor
+                for (size_t si = 0; si < GGML_MAX_SRC; si++) {
+                    if (tensor->src[si] != nullptr) {
+                        GGML_ASSERT(src_ss[si].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    }
+                }
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {
                 split_state = handle_per_row(src_ss);
