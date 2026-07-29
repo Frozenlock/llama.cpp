@@ -2940,7 +2940,16 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool sparse_small_batch = n_tokens == 1 ||
         (n_tokens <= (int64_t) llama_sparse_spec_ntok() && sparse_no_gather == 0 &&
          k->ne[3] == 1 && inp->get_kq_mask_spec() != nullptr);
-    if (sparse_no_gather != 1 && top_k != nullptr && sparse_small_batch && k->ne[2] > top_k->ne[0]) {
+    // context-adaptive crossover: below this many cached tokens, dense
+    // attention beats the sparse gather's fixed per-step overheads (indexer,
+    // top-k, gather allreduce) - measured crossover ~8-16K on 14x3090 TP2xPP7.
+    // Sparse takes over where dense attention decay dominates.
+    static const int64_t sparse_min_kv = [](){
+        const char * e = getenv("LLAMA_SPARSE_MIN_KV");
+        return (int64_t) (e ? atoll(e) : 0);
+    }();
+    if (sparse_no_gather != 1 && top_k != nullptr && sparse_small_batch &&
+            k->ne[2] > top_k->ne[0] && k->ne[2] >= sparse_min_kv) {
         const int64_t n_embd_k = k->ne[0];
         const int64_t n_embd_v = v->ne[0];
         const int64_t n_kv     = k->ne[2];

@@ -2394,6 +2394,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_PARTIAL:
+            ggml_cuda_flash_attn_partial(ctx, dst);
+            break;
+        case GGML_OP_FLASH_ATTN_COMBINE:
+            ggml_cuda_flash_attn_combine(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5197,6 +5203,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_FLASH_ATTN_PARTIAL:
+            // S2b partial attention: tile-family shapes only (DKQ 576/DV 512 incl.)
+            return op->src[4] == nullptr; // no sinks (would double-count across members)
+        case GGML_OP_FLASH_ATTN_COMBINE:
+            return true;
 
         default:
             return false;

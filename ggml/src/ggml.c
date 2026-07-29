@@ -1080,6 +1080,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "FLASH_ATTN_PARTIAL",
+    "FLASH_ATTN_COMBINE",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1100,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1195,6 +1197,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "flash_attn_partial(q, k, v, mask, sinks)",
+    "flash_attn_combine(partial)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1215,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6340,6 +6344,63 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_flash_attn_partial (S2b pair-sharded decode merge)
+
+struct ggml_tensor * ggml_flash_attn_partial(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * sinks,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    if (mask) {
+        GGML_ASSERT(ggml_is_contiguous(mask));
+    }
+
+    // [ numerator DV | max M | denom S ] x n_q x n_head x 2 member slots
+    // (dim order matches flash_attn_ext dst: [DV, n_q, n_head, seq])
+    int64_t ne[4] = { v->ne[0] + 2, q->ne[1], q->ne[2], 2 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, max_bias, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+    // op_params[8]: producing member slot (0/1), injected per member by the
+    // meta backend rebuild; single-device default 0
+    ggml_set_op_params_i32(result, 8, 0);
+
+    result->op     = GGML_OP_FLASH_ATTN_PARTIAL;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[4] = sinks;
+
+    return result;
+}
+
+// ggml_flash_attn_combine
+
+struct ggml_tensor * ggml_flash_attn_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * partial) {
+    GGML_ASSERT(partial->type == GGML_TYPE_F32);
+    GGML_ASSERT(partial->ne[3] == 2);
+    GGML_ASSERT(partial->ne[0] > 2);
+
+    int64_t ne[4] = { partial->ne[0] - 2, partial->ne[1], partial->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_FLASH_ATTN_COMBINE;
+    result->src[0] = partial;
 
     return result;
 }

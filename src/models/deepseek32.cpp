@@ -225,6 +225,12 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
         const char * e = getenv("LLAMA_SPARSE_SPEC_NTOK");
         return e ? atoi(e) : 8;
     }();
+    // must match the crossover gate in llama-graph.cpp: below this KV extent
+    // the gather branch runs dense, so the selection would be discarded
+    static const int64_t sparse_min_kv = [](){
+        const char * e = getenv("LLAMA_SPARSE_MIN_KV");
+        return (int64_t) (e ? atoll(e) : 0);
+    }();
     const bool is_glm_dsa = model.arch == LLM_ARCH_GLM_DSA;
     ggml_tensor * top_k_shared = nullptr;
 
@@ -255,7 +261,9 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
             // filled (later decode selection reads it) and the O(n^2) score
             // matrix + top-k argsort are skipped. LLAMA_SPARSE_PREFILL_TOPK=1
             // restores the full computation on every batch.
-            const bool need_topk = n_tokens <= sparse_spec_ntok || sparse_prefill_topk;
+            const bool need_topk = (n_tokens <= sparse_spec_ntok &&
+                    inp_attn_dsa->mctx->get_mla()->get_n_kv() >= (uint32_t) sparse_min_kv) ||
+                    sparse_prefill_topk;
 
             // lightning indexer
             if (indexer_full_layer) {

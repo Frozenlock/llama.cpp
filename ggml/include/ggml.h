@@ -571,6 +571,8 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_FLASH_ATTN_PARTIAL,
+        GGML_OP_FLASH_ATTN_COMBINE,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2600,6 +2602,31 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // Partial flash attention for pair-sharded KV (S2b decode merge).
+    // Same srcs/params as ggml_flash_attn_ext, but the result is the
+    // UNNORMALIZED per-member partial: dst F32 [DV+2, n_head, n_q, 2] where
+    // row = [ numerator O | kq max M | softmax denom S ] and dim3 indexes the
+    // TP pair member slot. The producing member writes its own slot and zeroes
+    // the peer slot (member index injected via op_params[8] by the meta
+    // backend rebuild); an allreduce then completes both slots.
+    GGML_API struct ggml_tensor * ggml_flash_attn_partial(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * sinks,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap);
+
+    // Merge the two member slots of ggml_flash_attn_partial into the final
+    // normalized attention output [DV, n_head, n_q] (log-sum-exp combine;
+    // identical result on every member).
+    GGML_API struct ggml_tensor * ggml_flash_attn_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * partial);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

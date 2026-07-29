@@ -969,6 +969,68 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// S2b pair-sharded partial output: like flash_attn_combine_results but emits
+// the UNNORMALIZED [numerator | kq max M | softmax denom S] row into the
+// producing member's slot of a [D+2, ne01, ne02, 2] dst and zeroes the peer
+// slot; a cross-member allreduce then completes both slots and
+// GGML_OP_FLASH_ATTN_COMBINE merges them (log-sum-exp).
+template<int D>
+__launch_bounds__(D, 1)
+static __global__ void flash_attn_combine_to_partial(
+        const float  * VKQ_parts,
+        const float2 * VKQ_meta,
+        float * dst,
+        const int parallel_blocks,
+        const int member) {
+    const int ne01 = gridDim.x; // n_q
+    const int ne02 = gridDim.y; // n_head
+
+    const int col  = blockIdx.x;
+    const int head = blockIdx.y;
+
+    // FA temp buffers use the [0, 2, 1, 3]-permuted row order
+    const int j_src = col*ne02 + head;
+    VKQ_parts += (int64_t) j_src * parallel_blocks*D;
+    VKQ_meta  += (int64_t) j_src * parallel_blocks;
+
+    // dst is plain contiguous [D+2, ne01, ne02, 2]
+    const int64_t row_stride = D + 2;
+    const int64_t slot_sz    = (int64_t) ne01*ne02*row_stride;
+    float * out_own  = dst + member*slot_sz       + ((int64_t) head*ne01 + col)*row_stride;
+    float * out_peer = dst + (member ^ 1)*slot_sz + ((int64_t) head*ne01 + col)*row_stride;
+
+    const int tid = threadIdx.x;
+    __builtin_assume(tid < D);
+
+    extern __shared__ float2 meta[];
+    for (int i = tid; i < 2*parallel_blocks; i += D) {
+        ((float *) meta)[i] = ((const float *) VKQ_meta)[i];
+    }
+    __syncthreads();
+
+    float kqmax = meta[0].x;
+    for (int l = 1; l < parallel_blocks; ++l) {
+        kqmax = max(kqmax, meta[l].x);
+    }
+
+    float num = 0.0f;
+    float den = 0.0f;
+    for (int l = 0; l < parallel_blocks; ++l) {
+        const float sc = expf(meta[l].x - kqmax);
+        num += sc * VKQ_parts[l*D + tid];
+        den += sc * meta[l].y;
+    }
+
+    out_own[tid]  = num;
+    out_peer[tid] = 0.0f;
+    if (tid == 0) {
+        out_own[D]      = kqmax;
+        out_own[D + 1]  = den;
+        out_peer[D]     = 0.0f;
+        out_peer[D + 1] = 0.0f;
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -986,6 +1048,20 @@ void launch_fattn(
     const ggml_tensor * sinks = dst->src[4];
 
     ggml_tensor * KQV = dst;
+
+    // S2b partial mode: dst is [DV+2, n_q, n_head, 2] (unnormalized member
+    // partial); the kernels themselves are unchanged - they write dst_tmp/
+    // dst_tmp_meta as in the multi-parallel-block case and the
+    // combine_to_partial epilogue emits [num|M|S] into the member slot.
+    const bool fattn_partial = KQV->op == GGML_OP_FLASH_ATTN_PARTIAL;
+    const int  fattn_member  = fattn_partial ? ggml_get_op_params_i32(KQV, 8) : 0;
+    const int64_t kqv_nelem_logical = fattn_partial ?
+        (int64_t) DV*Q->ne[1]*Q->ne[2]*Q->ne[3] : ggml_nelements(KQV);
+    const int64_t kqv_nrows_logical = fattn_partial ?
+        Q->ne[1]*Q->ne[2]*Q->ne[3] : ggml_nrows(KQV);
+    GGML_ASSERT(!fattn_partial || !stream_k);
+    GGML_ASSERT(!fattn_partial || sinks == nullptr);
+    GGML_ASSERT(!fattn_partial || Q->ne[3] == 1);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1152,6 +1228,12 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
+        if (fattn_partial) {
+            // meta (M,S) is only written on the multi-block path
+            GGML_ASSERT(ntiles_KV >= 2 && "FLASH_ATTN_PARTIAL needs >= 2 KV tiles");
+            parallel_blocks = std::max(parallel_blocks, 2);
+        }
+
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
@@ -1178,9 +1260,9 @@ void launch_fattn(
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
-        if (parallel_blocks > 1) {
-            dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
-            dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+        if (parallel_blocks > 1 || fattn_partial) {
+            dst_tmp.alloc(parallel_blocks*kqv_nelem_logical);
+            dst_tmp_meta.alloc(parallel_blocks*kqv_nrows_logical);
         }
     }
 
@@ -1215,7 +1297,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        !stream_k && (parallel_blocks > 1 || fattn_partial) ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
@@ -1261,6 +1343,15 @@ void launch_fattn(
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
+    } else if (fattn_partial) {
+        GGML_ASSERT(parallel_blocks > 1);
+        const dim3 block_dim_combine(DV, 1, 1);
+        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], 1);
+        const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_combine_to_partial<DV>, launch_params,
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, fattn_member);
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);

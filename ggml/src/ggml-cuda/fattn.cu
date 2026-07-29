@@ -601,3 +601,53 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+// S2b pair-sharded decode: partial attention (see GGML_OP_FLASH_ATTN_PARTIAL).
+// Kernels are the unchanged tile family; launch_fattn detects the op on dst
+// and swaps the epilogue for flash_attn_combine_to_partial.
+void ggml_cuda_flash_attn_partial(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_PARTIAL);
+    GGML_ASSERT(dst->src[4] == nullptr && "sinks unsupported in partial attention");
+    ggml_cuda_flash_attn_ext_tile(ctx, dst);
+}
+
+// Merge the two member slots of a completed FLASH_ATTN_PARTIAL allreduce:
+// dst[row] = (e^{Ma-M} numA + e^{Mb-M} numB) / (e^{Ma-M} Sa + e^{Mb-M} Sb).
+// Scale-invariant per slot, so an all-zero (empty-member) slot is naturally
+// inert through the S>0 guards.
+static __global__ void k_flash_attn_combine(
+        const float * part, float * dst, const int64_t D, const int64_t nrows) {
+    const int64_t row = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    const float * a = part + row*(D + 2);
+    const float * b = part + nrows*(D + 2) + row*(D + 2);
+    const float Ma = a[D], Sa = a[D + 1];
+    const float Mb = b[D], Sb = b[D + 1];
+    const float M  = fmaxf(Ma, Mb);
+    const float ea = Sa > 0.0f ? expf(Ma - M) : 0.0f;
+    const float eb = Sb > 0.0f ? expf(Mb - M) : 0.0f;
+    const float S  = ea*Sa + eb*Sb;
+    const float inv_S = S > 0.0f ? 1.0f/S : 0.0f;
+    for (int64_t d = threadIdx.x; d < D; d += blockDim.x) {
+        dst[row*D + d] = (ea*a[d] + eb*b[d]) * inv_S;
+    }
+}
+
+void ggml_cuda_flash_attn_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * part = dst->src[0];
+    GGML_ASSERT(part->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(part->ne[3] == 2);
+    GGML_ASSERT(ggml_is_contiguous(part) && ggml_is_contiguous(dst));
+    const int64_t D     = dst->ne[0];
+    const int64_t nrows = dst->ne[1]*dst->ne[2];
+    GGML_ASSERT(part->ne[0] == D + 2);
+
+    const dim3 grid((unsigned) nrows, 1, 1);
+    const dim3 block(256, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
+    ggml_cuda_kernel_launch(k_flash_attn_combine, lp,
+        (const float *) part->data, (float *) dst->data, D, nrows);
+    CUDA_CHECK(cudaGetLastError());
+}
