@@ -2589,6 +2589,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return idr;
             };
 
+            // GGML_META_LOG_SUBGRAPHS=1: one line per (re)split naming every
+            // subgraph boundary node — fragmentation diagnosis for prefill.
+            static const bool log_subgraphs = getenv("GGML_META_LOG_SUBGRAPHS") != nullptr;
+            std::string sg_bounds;
+
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -2611,6 +2616,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 backend_ctx->subgraph_gather[n_subgraphs] = is_gather ? 1 : 0;
                 backend_ctx->subgraph_gather_node[n_subgraphs] = is_gather ? i : -1;
+
+                if (log_subgraphs) {
+                    sg_bounds += " ";
+                    sg_bounds += is_gather ? "G:" : "P:";
+                    sg_bounds += ggml_op_name(node->op);
+                    sg_bounds += "(";
+                    sg_bounds += node->name;
+                    sg_bounds += ")";
+                }
 
                 const int i_delayed = is_gather ? (int) i : get_i_delayed(i);
 
@@ -2639,6 +2653,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+
+            if (log_subgraphs) {
+                static int sg_logged = 0;
+                if (sg_logged < 60) {
+                    sg_logged++;
+                    fprintf(stderr, "[SGCOUNT] ord=%d nodes=%d subgraphs=%zu bounds:%s\n",
+                            backend_ctx->ctx_ord, cgraph->n_nodes, n_subgraphs, sg_bounds.c_str());
+                    fflush(stderr);
+                }
+            }
         }
 
         backend_ctx->uid         = cgraph->uid;

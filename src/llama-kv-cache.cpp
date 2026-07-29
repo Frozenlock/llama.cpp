@@ -1268,6 +1268,18 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
 
+    // LLAMA_LOG_NKV: per-ubatch KV extent visibility (prefill cost ~ n_kv).
+    // The DSA dual cache calls this once per sub-cache (mla then lid).
+    static const bool log_nkv = getenv("LLAMA_LOG_NKV") != nullptr;
+    if (log_nkv) {
+        static int n_logged = 0;
+        if (n_logged < 400) {
+            n_logged++;
+            fprintf(stderr, "[NKV] this=%p n_kv=%u used_max_p1=%u size=%zu\n",
+                    (const void *) this, result, v_cells[sinfo.strm[0]].used_max_p1(), (size_t) v_cells[sinfo.strm[0]].size());
+        }
+    }
+
     return result;
 }
 

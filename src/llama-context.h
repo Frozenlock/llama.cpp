@@ -401,6 +401,14 @@ private:
     std::array<std::vector<std::pair<ggml_backend_t, ggml_backend_event_t>>, 2> input_guard_ev;
     int  input_guard_slot = 0;
 
+    // whether the sched's ggml-alloc plan is the full-extent worst-case pp
+    // plan (from graph_reserve). Decode graphs with a different topology
+    // (GLM-DSA sparse top-k/gather) re-plan the compute buffers down to
+    // decode sizes; growing prefill chunks then reallocate EVERY ubatch, each
+    // realloc synchronizing all backends (pipeline drain). process_ubatch
+    // re-primes the plan at decode->prefill transitions when this is false.
+    bool sched_plan_primed = true;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

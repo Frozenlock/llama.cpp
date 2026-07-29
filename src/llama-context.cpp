@@ -1446,6 +1446,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int64_t pu1 = pu_log ? ggml_time_us() : 0;
 
+    // GLM-DSA sparse decode graphs (top-k + selected-row gather, n_tokens==1)
+    // have a different topology than prefill graphs, so a single ggml-alloc
+    // plan cannot hold both: each decode re-plans the compute buffers down to
+    // decode sizes, and every subsequent (growing) prefill chunk then triggers
+    // a reallocation which synchronizes ALL backends and drains the chunk
+    // pipeline (measured 2.3-5.6 s PER UBATCH at 26K: sparse prefill 239 t/s
+    // vs dense 900+). Re-prime the sched with the full-extent worst-case pp
+    // plan when prefill resumes after smaller graphs: one sync at a request
+    // boundary (pipeline empty) buys realloc-free, fully pipelined prefill.
+    // LLAMA_SCHED_REPRIME=0 disables.
+    {
+        static const bool sched_reprime = [](){
+            const char * e = getenv("LLAMA_SCHED_REPRIME");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (sched_reprime && cparams.pipeline_parallel && memory &&
+                ubatch.n_tokens >= 64 && !sched_plan_primed) {
+            const int64_t t_rp = ggml_time_us();
+            ggml_backend_sched_synchronize(sched.get());
+            llama_memory_context_ptr mctx_full = memory->init_full();
+            if (mctx_full) {
+                const uint32_t n_seqs       = cparams.n_seq_max;
+                const uint32_t n_tokens_pp  = std::min(cparams.n_ctx, cparams.n_ubatch);
+                const uint32_t n_outputs_pp = std::min(n_tokens_pp, cparams.n_outputs_max);
+                if (graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx_full.get(), model.hparams.no_alloc)) {
+                    sched_plan_primed = true;
+                    LLAMA_LOG_INFO("%s: sched re-primed for prefill in %.1f ms\n", __func__,
+                            (ggml_time_us() - t_rp)/1000.0);
+                } else {
+                    LLAMA_LOG_WARN("%s: sched re-prime failed - continuing without\n", __func__);
+                }
+            }
+        }
+    }
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -1488,6 +1523,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // a small-batch (decode-shaped) graph may have re-planned the compute
+        // buffers away from the worst-case pp plan - re-prime before the next
+        // prefill chunk (see the sched_reprime block above)
+        if (ubatch.n_tokens < 64) {
+            sched_plan_primed = false;
         }
 
         // recompute the set of backends owning graph-input leafs (guard below);
