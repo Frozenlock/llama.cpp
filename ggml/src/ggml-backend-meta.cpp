@@ -1124,6 +1124,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_im
             case GGML_OP_TOP_K: {
                 split_state = handle_per_row(src_ss);
             } break;
+            case GGML_OP_FLASH_ATTN_PARTIAL: {
+                // each member fills its own slot of the doubled dst (peer slot
+                // zeroed); the standard allreduce completes both slots
+                split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+            } break;
+            case GGML_OP_FLASH_ATTN_COMBINE: {
+                // consumes the completed (mirrored) partial pair; result is
+                // computed identically on every member
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
             case GGML_OP_LEAKY_RELU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
@@ -2482,6 +2492,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             fprintf(stderr, "[KVSGROWS] inject member=%zu node=%s base=%lld\n",
                                     j, node->name, (long long) base_j);
                         }
+                    }
+                }
+
+                // S2b partial attention: tell the node which member slot of
+                // the [DV+2, H, T, 2] dst it produces (op_params[8]); the
+                // epilogue zeroes the peer slot and the standard allreduce
+                // completes both.
+                if (node->op == GGML_OP_FLASH_ATTN_PARTIAL) {
+                    ggml_set_op_params_i32(bcj.nodes[i], 8, (int32_t) j);
+                    static int fp_logged = 0;
+                    if (fp_logged < 4) {
+                        fp_logged++;
+                        fprintf(stderr, "[S2BFA] inject member=%zu node=%s\n", j, node->name);
                     }
                 }
             }
