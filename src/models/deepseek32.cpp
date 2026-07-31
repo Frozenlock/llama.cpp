@@ -251,8 +251,11 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
             ggml_tensor * top_k = nullptr;
 
+            // metadata-driven (LLM_KV_ATTENTION_INDEXER_TYPES with the official
+            // GLM-5.2 config.json fallback {0,1,2} u {6+4k}); non-GLM DSA models
+            // keep all-full behavior via the is_glm_dsa gate
             const bool indexer_full_layer = !(glm_index_share && is_glm_dsa) ||
-                il <= 1 || (il >= 6 && il <= 70 && (il - 6) % 4 == 0);
+                hparams.is_indexer_full(il);
 
             // The top-k selection is consumed by build_attn at single-token
             // decode and for small spec-decode verify batches (MTP / ngram,
