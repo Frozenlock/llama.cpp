@@ -1566,6 +1566,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // the safe blocking path if the async copy isn't available.
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    // see the non-user-input branch below: a device-to-device async
+                    // copy runs on the source stream, which must also observe the
+                    // consumption event before overwriting input_cpy
+                    if (input_backend != split_backend && input_backend->iface.event_wait != NULL) {
+                        ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    }
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
@@ -1577,6 +1583,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    // The async copy below executes on the SOURCE backend's stream
+                    // (e.g. the CUDA cpy_tensor_async enqueues on the src stream and
+                    // only makes the dst stream wait afterwards). A wait enqueued on
+                    // the destination stream does not order that copy: with
+                    // n_copies > 1 pipeline overlap, an upstream stage that runs
+                    // ahead can overwrite input_cpy[cur_copy] while the destination
+                    // is still consuming it two ubatches back (state-dependent
+                    // prefill corruption at stage-boundary layers). The source
+                    // stream must observe the same consumption event before it may
+                    // perform the overwrite.
+                    if (input_backend != split_backend && input_backend->iface.event_wait != NULL) {
+                        ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    }
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
