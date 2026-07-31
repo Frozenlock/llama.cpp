@@ -1435,7 +1435,8 @@ bool llama_context::set_adapter_cvec(
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // LLAMA_DECODE_TIMING >= 3: per-phase breakdown of ubatch processing
     static const int pu_timing = [](){ const char * e = getenv("LLAMA_DECODE_TIMING"); return e ? atoi(e) : 0; }();
-    const bool pu_log = pu_timing >= 3 && ubatch.n_tokens > 64;
+    // >= 3: prefill-width ubatches only; >= 4: every ubatch incl. decode/verify
+    const bool pu_log = pu_timing >= 3 && (ubatch.n_tokens > 64 || pu_timing >= 4);
     const int64_t pu0 = pu_log ? ggml_time_us() : 0;
 
     if (mctx && !mctx->apply()) {
@@ -1637,8 +1638,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (pu_log) {
         const int64_t pu6 = ggml_time_us();
-        fprintf(stderr, "PU n=%d reuse=%d apply=%.1f build=%.1f alloc=%.1f inputs=%.1f compute=%.1f total=%.1fms\n",
-                (int) ubatch.n_tokens, pu_reused ? 1 : 0,
+        fprintf(stderr, "PU ctx=%p n=%d reuse=%d apply=%.1f build=%.1f alloc=%.1f inputs=%.1f compute=%.1f total=%.1fms\n",
+                (void *) this, (int) ubatch.n_tokens, pu_reused ? 1 : 0,
                 (pu1-pu0)/1000.0, (pu3-pu2)/1000.0, (pu4-pu3)/1000.0, (pu5-pu4)/1000.0, (pu6-pu5)/1000.0,
                 (pu6-pu0)/1000.0);
         fflush(stderr);
@@ -2303,11 +2304,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_sched_synchronize(sched.get());
                 const int64_t dt3 = ggml_time_us();
                 dt_gpu += dt3 - dt2;
-                if (n_tokens_all > 64) {
-                    fprintf(stderr, "DT_UB i=%d n=%d proc=%.1fms extract=%.1fms gpu=%.1fms\n",
-                            dt_n_ub, (int) ubatch.n_tokens, (dt1-dt0)/1000.0, (dt2-dt1)/1000.0, (dt3-dt2)/1000.0);
-                    fflush(stderr);
-                }
+                fprintf(stderr, "DT_UB ctx=%p i=%d n=%d proc=%.1fms extract=%.1fms gpu=%.1fms\n",
+                        (void *) this, dt_n_ub, (int) ubatch.n_tokens, (dt1-dt0)/1000.0, (dt2-dt1)/1000.0, (dt3-dt2)/1000.0);
+                fflush(stderr);
             }
         }
 

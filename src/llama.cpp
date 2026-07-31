@@ -183,28 +183,66 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             // TP-SPIKE hybrid TP x PP: partition the devices into groups of
             // LLAMA_TP_GROUP_SIZE and create one meta (TP) device per group; the
             // regular layer-split logic then pipelines across the groups.
-            size_t tp_group_size = devs.size();
+            // LLAMA_TP_GROUP_SIZE also accepts a comma list of group sizes
+            // summing to the device count (e.g. "4,4,4,2" over 14 GPUs) for
+            // mixed-size groups; the split callback derives each tensor's
+            // member count from its meta buffer, so groups need not be uniform.
+            std::vector<size_t> tp_group_sizes;
             if (const char * env = getenv("LLAMA_TP_GROUP_SIZE")) {
-                const size_t g = std::stoul(env);
-                if (g >= 1 && g <= devs.size() && devs.size() % g == 0) {
-                    tp_group_size = g;
-                } else {
-                    LLAMA_LOG_WARN("%s: ignoring LLAMA_TP_GROUP_SIZE=%s (must divide %zu)\n",
+                const std::string s(env);
+                size_t sum = 0;
+                size_t pos = 0;
+                bool ok = true;
+                while (pos < s.size()) {
+                    size_t comma = s.find(',', pos);
+                    if (comma == std::string::npos) {
+                        comma = s.size();
+                    }
+                    const size_t g = std::stoul(s.substr(pos, comma - pos));
+                    if (g < 1 || g > devs.size()) {
+                        ok = false;
+                        break;
+                    }
+                    tp_group_sizes.push_back(g);
+                    sum += g;
+                    pos = comma + 1;
+                }
+                if (ok && tp_group_sizes.size() == 1) {
+                    // uniform form: single value must divide the device count
+                    const size_t g = tp_group_sizes[0];
+                    if (devs.size() % g == 0) {
+                        tp_group_sizes.assign(devs.size()/g, g);
+                    } else {
+                        ok = false;
+                    }
+                } else if (ok && sum != devs.size()) {
+                    ok = false;
+                }
+                if (!ok) {
+                    LLAMA_LOG_WARN("%s: ignoring LLAMA_TP_GROUP_SIZE=%s (single value must divide %zu, or list must sum to it)\n",
                         __func__, env, devs.size());
+                    tp_group_sizes.clear();
                 }
             }
+            if (tp_group_sizes.empty()) {
+                tp_group_sizes.push_back(devs.size());
+            }
 
-            model->get_split_state_ud.n_devices = tp_group_size;
+            // fallback only: the split callback uses the per-buffer member count
+            model->get_split_state_ud.n_devices = tp_group_sizes[0];
             model->get_split_state_ud.model     = model;
-            for (size_t g0 = 0; g0 < devs.size(); g0 += tp_group_size) {
-                if (tp_group_size < devs.size()) {
+            size_t g0 = 0;
+            for (size_t gi = 0; gi < tp_group_sizes.size(); gi++) {
+                const size_t gsz = tp_group_sizes[gi];
+                if (tp_group_sizes.size() > 1) {
                     LLAMA_LOG_INFO("%s: creating TP group %zu with devices [%zu..%zu]\n",
-                        __func__, g0/tp_group_size, g0, g0 + tp_group_size - 1);
+                        __func__, gi, g0, g0 + gsz - 1);
                 }
                 gpus.push_back({
                     true, ggml_backend_meta_device(
-                    devs.data() + g0, tp_group_size, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                    devs.data() + g0, gsz, llama_meta_device_get_split_state, &model->get_split_state_ud)
                 });
+                g0 += gsz;
             }
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

@@ -207,6 +207,7 @@ public:
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_k_idxs_i32(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
@@ -363,6 +364,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_size() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -390,6 +392,7 @@ public:
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_idxs_i32(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;

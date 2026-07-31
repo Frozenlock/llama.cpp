@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1270,10 +1271,16 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // LLAMA_LOG_NKV: per-ubatch KV extent visibility (prefill cost ~ n_kv).
     // The DSA dual cache calls this once per sub-cache (mla then lid).
-    static const bool log_nkv = getenv("LLAMA_LOG_NKV") != nullptr;
-    if (log_nkv) {
+    // value = print budget (values <= 1 keep the legacy 400 default)
+    static const int log_nkv = [](){
+        const char * e = getenv("LLAMA_LOG_NKV");
+        if (e == nullptr) return 0;
+        const int v = atoi(e);
+        return v > 1 ? v : 400;
+    }();
+    if (log_nkv > 0) {
         static int n_logged = 0;
-        if (n_logged < 400) {
+        if (n_logged < log_nkv) {
             n_logged++;
             fprintf(stderr, "[NKV] this=%p n_kv=%u used_max_p1=%u size=%zu\n",
                     (const void *) this, result, v_cells[sinfo.strm[0]].used_max_p1(), (size_t) v_cells[sinfo.strm[0]].size());
@@ -1507,6 +1514,42 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
     }
+
+    // LLAMA_LOG_KIDX=<budget>: physical cell placement per ubatch (min/max
+    // destination cell + first position). Splits "prompt starts at cell 0"
+    // assumptions from reality on state-dependent retrieval failures.
+    static const int log_kidx = [](){ const char * e = getenv("LLAMA_LOG_KIDX"); return e ? atoi(e) : 0; }();
+    if (log_kidx > 0) {
+        static std::atomic<int> n_logged{0};
+        if (n_logged.fetch_add(1) < log_kidx) {
+            int64_t mn = INT64_MAX, mx = INT64_MIN;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                mn = std::min(mn, data[i]);
+                mx = std::max(mx, data[i]);
+            }
+            fprintf(stderr, "[KIDX] this=%p n_tok=%u cell_min=%lld cell_max=%lld pos0=%lld\n",
+                    (const void *) this, n_tokens, (long long) mn, (long long) mx,
+                    (long long) (ubatch->pos ? ubatch->pos[0] : -1));
+        }
+    }
+}
+
+// I32 variant for GET_ROWS-consuming inputs (the shared-top-k verify tail);
+// same row indices as set_input_k_idxs, device-buffer safe via tensor_set.
+void llama_kv_cache::set_input_k_idxs_i32(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    GGML_ASSERT(ubatch->n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] >= ubatch->n_tokens);
+
+    // padding entries (alignment tail) gather row 0; they are masked -inf by
+    // the static spec mask and excluded from the collision comparison
+    std::vector<int32_t> data((size_t) dst->ne[0], 0);
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const int64_t offs = sinfo.strm[s]*get_size();
+        for (uint32_t i = 0; i < sinfo.size(); ++i) {
+            data[s*sinfo.size() + i] = (int32_t) (offs + sinfo.idxs[s][i]);
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size()*sizeof(int32_t));
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -2639,6 +2682,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_size() const {
+    return kv->get_size();
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2685,6 +2732,10 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_k_idxs_i32(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_k_idxs_i32(dst, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

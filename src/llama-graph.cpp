@@ -517,6 +517,55 @@ static int llama_sparse_spec_ntok() {
     return v;
 }
 
+static bool llama_kv_shard_s2b() {
+    static const bool enabled = []() {
+        const char * e = getenv("LLAMA_KV_SHARD_S2B");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// LLAMA_S2B_PREFILL=1: prefill/dense attention under the KV shard runs as
+// per-member partial FA over each member's OWN cache slice + log-sum-exp
+// merge, instead of the full-KV gather + dense FA. Default off.
+static bool llama_s2b_prefill() {
+    static const bool enabled = []() {
+        const char * e = getenv("LLAMA_S2B_PREFILL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// from ggml-backend-impl.h (not on this target's include path)
+extern "C" {
+    bool   ggml_backend_buffer_is_meta    (ggml_backend_buffer_t buf);
+    size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf);
+}
+
+// S2b partial-attention slot count = member count of the TP group that owns
+// this layer's KV cache (mixed-size groups have different counts per layer).
+// 2 is the single-device debug default: member 0 fills slot 0, slot 1 stays
+// the neutral empty partial.
+static int llama_s2b_n_slots(const ggml_tensor * cache_tensor) {
+    if (cache_tensor != nullptr) {
+        const ggml_tensor * root = cache_tensor->view_src != nullptr ? cache_tensor->view_src : cache_tensor;
+        if (root->buffer != nullptr && ggml_backend_buffer_is_meta(root->buffer)) {
+            return (int) ggml_backend_meta_buffer_n_bufs(root->buffer);
+        }
+    }
+    return 2;
+}
+
+// slot capacity of the s2b ownvec input; must cover the largest TP group
+// (mode-2 generated masks ignore the host data, but the per-member column
+// view offset j*nb[2] must stay inside the allocation)
+#define LLAMA_S2B_OWNVEC_SLOTS 4
+
+static void llama_s2b_set_view_stride(ggml_tensor * view, size_t stride) {
+    static_assert(sizeof(stride) <= sizeof(view->op_params) - 2*sizeof(int32_t));
+    memcpy(view->op_params + 2*sizeof(int32_t), &stride, sizeof(stride));
+}
+
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
@@ -542,16 +591,21 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
 
+    // s2b-at-prefill compacted mask: same host fill as the mla mask (the meta
+    // set_tensor path scatters the per-member row slices). Unallocated when
+    // the graph did not take the s2b prefill branch; the fill skips then.
+    if (self_kq_mask_s2bpf != nullptr) {
+        mctx->get_mla()->set_input_kq_mask(self_kq_mask_s2bpf, ubatch, cparams.causal_attn);
+    }
+
     mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
 
     mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
 
     mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
 
-    // spec-decode block mask: query t attends only its own gathered top-k
-    // block [t*n_sel, (t+1)*n_sel); padded query rows stay -inf (matches the
-    // dense mask's padding semantics). Unallocated when the graph does not
-    // take the small-batch gather branch.
+    // spec-decode block mask (legacy input, unused by the per-query verify
+    // loop but kept as the small-batch gate); padded query rows stay -inf.
     if (self_kq_mask_spec != nullptr && self_kq_mask_spec->buffer != nullptr) {
         const int64_t n_out  = self_kq_mask_spec->ne[0];
         const int64_t n_qpad = self_kq_mask_spec->ne[1];
@@ -563,6 +617,24 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
             std::fill_n(m.data() + t*n_out + t*n_sel, (size_t) n_sel, (uint16_t) 0);
         }
         ggml_backend_tensor_set(self_kq_mask_spec, m.data(), 0, m.size()*sizeof(uint16_t));
+    }
+
+    if (self_s2b_ownvec != nullptr && self_s2b_ownvec->buffer != nullptr) {
+        // Host fill is only read on the single-device (non-meta) debug path;
+        // the meta rebuild regenerates per-member ownership on device from
+        // base/extent (getrows sh_mode==2). Fill contiguous 1/n_slots ranges.
+        const int64_t n_kv    = self_s2b_ownvec->ne[1];
+        const int64_t n_slots = self_s2b_ownvec->ne[2];
+        const int64_t size    = mctx->get_mla()->get_size();
+        std::vector<float> own((size_t) (n_kv*n_slots), -INFINITY);
+        for (int64_t m = 0; m < n_slots; ++m) {
+            const int64_t lo = size*m/n_slots;
+            const int64_t hi = size*(m + 1)/n_slots;
+            for (int64_t i = lo; i < hi && i < n_kv; ++i) {
+                own[(size_t) (m*n_kv + i)] = 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(self_s2b_ownvec, own.data(), 0, own.size()*sizeof(float));
     }
 }
 
@@ -578,6 +650,10 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
     res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
+
+    if (self_kq_mask_s2bpf != nullptr) {
+        res &= can_reuse_kq_mask(self_kq_mask_s2bpf, mctx->get_mla(), params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -2940,10 +3016,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool sparse_small_batch = n_tokens == 1 ||
         (n_tokens <= (int64_t) llama_sparse_spec_ntok() && sparse_no_gather == 0 &&
          k->ne[3] == 1 && inp->get_kq_mask_spec() != nullptr);
-    // context-adaptive crossover: below this many cached tokens, dense
-    // attention beats the sparse gather's fixed per-step overheads (indexer,
-    // top-k, gather allreduce) - measured crossover ~8-16K on 14x3090 TP2xPP7.
-    // Sparse takes over where dense attention decay dominates.
+    // Debug knob only (LLAMA_SPARSE_MIN_KV): below this many cached tokens,
+    // fall back to dense attention reconstructed from the sharded cache.
+    // Default 0 = always sparse; the dense fallback is NOT a fix for sparse
+    // decode overheads and is not to be re-enabled as a default.
     static const int64_t sparse_min_kv = [](){
         const char * e = getenv("LLAMA_SPARSE_MIN_KV");
         return (int64_t) (e ? atoll(e) : 0);
@@ -2955,9 +3031,25 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t n_kv     = k->ne[2];
         const int64_t n_stream = k->ne[3];
         const int64_t n_sel    = top_k->ne[0] * n_tokens; // per-query blocks, flattened
+        // Bisect modes:
+        //   0 = real position-sharded K/V + ownership mask
+        //   1 = gathered full K/V on both members, no ownership mask
+        //   2 = gathered full K/V on both members, WITH ownership mask
+        // Mode 2 isolates empty-member partial/combine + ownership masking
+        // from the local sharded GET_ROWS implementation.
+        static const int s2b_bisect_full_kv = []() {
+            const char * e = getenv("LLAMA_S2B_BISECT_FULL_KV");
+            return e != nullptr ? atoi(e) : 0;
+        }();
+        static const int s2b_bisect_q_roundtrip = []() {
+            const char * e = getenv("LLAMA_S2B_BISECT_Q_ROUNDTRIP");
+            return e != nullptr ? atoi(e) : 0;
+        }();
 
         // indices [n_top_k, n_tokens, 1, n_stream] -> [n_top_k*n_tokens, n_stream]
-        ggml_tensor * idx = ggml_reshape_2d(ctx0, ggml_cont(ctx0, top_k), n_sel, n_stream);
+        ggml_tensor * idx = ggml_is_contiguous(top_k)
+            ? ggml_reshape_2d(ctx0, top_k, n_sel, n_stream)
+            : ggml_reshape_2d(ctx0, ggml_cont(ctx0, top_k), n_sel, n_stream);
 
         if (sparse_no_gather == 2 || sparse_no_gather == 4) {
             // identity gather of ALL rows; mode 2 = real mask, mode 4 = zero
@@ -2970,13 +3062,19 @@ ggml_tensor * llm_graph_context::build_attn(
         // view the cache as [n_embd, n_kv, n_stream] (no copy) and gather selected
         // rows. Under kv_shard, source the RAW sharded cache: the gathered cont is
         // then dead code in sparse decode graphs (pruned - no whole-KV gather).
-        ggml_tensor * k_base = kv_shard_dsa ? k_raw : k;
+        ggml_tensor * k_base = kv_shard_dsa && s2b_bisect_full_kv == 0 ? k_raw : k;
         ggml_tensor * k_src = ggml_view_3d(ctx0, k_base, n_embd_k, n_kv, n_stream, k_base->nb[2], k_base->nb[3], 0);
         // Gather ONCE (full-width rows) and take V as a strided view of the
         // gathered K (V is a row prefix, same as the dense path). Under
         // kv_shard this keeps a SINGLE partial node -> a single allreduce
         // completes both K and V (the reduce runs on one boundary node only).
-        ggml_tensor * k_g = ggml_get_rows(ctx0, k_src, idx);  // [n_embd_k, n_out, n_stream] F32
+        const bool s2b_local = kv_shard_dsa && llama_kv_shard_s2b() && s2b_bisect_full_kv == 0;
+        ggml_tensor * k_g = s2b_local
+            ? ggml_get_rows_as(ctx0, k_src, idx, GGML_TYPE_F16)
+            : ggml_get_rows(ctx0, k_src, idx);
+        if (kv_shard_dsa && llama_kv_shard_s2b() && s2b_bisect_full_kv == 0) {
+            ggml_format_name(k_g, "s2b_local_k-%d", il);
+        }
         k_g = ggml_reshape_4d(ctx0, k_g, n_embd_k, 1, n_out, n_stream);
         ggml_tensor * v_g = ggml_view_4d(ctx0, k_g, n_embd_v, 1, n_out, n_stream,
             k_g->nb[1], k_g->nb[2], k_g->nb[3], 0);
@@ -3008,10 +3106,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
 
         ggml_tensor * m_g;
-        if (n_tokens > 1) {
-            // block-diagonal spec mask (host-filled input; see set_input)
-            m_g = inp->get_kq_mask_spec();
-        } else if (sparse_no_gather == 2) {
+        if (sparse_no_gather == 2) {
             m_g = kq_mask;
         } else if (sparse_no_gather == 5) {
             // real mask values gathered for the selected columns: transpose the
@@ -3027,10 +3122,296 @@ ggml_tensor * llm_graph_context::build_attn(
                 0.0f);
         }
 
-        cur = build_attn_mha(q, k_g, v_g, kq_b, m_g, sinks, v_mla, kq_scale, il);
+        // Exact per-query verify (T>1 spec batches): run one small FA per
+        // query over ITS OWN gathered top-k block. Mathematically identical to
+        // the T=1 sparse step (same softmax terms - preserves greedy output
+        // invariance), but avoids streaming the whole [top_k*T] gathered
+        // buffer for every query the way a block-diagonal mask does (~4x less
+        // attention traffic at T=4).
+        const bool spec_pq = n_tokens > 1 && sparse_no_gather == 0 &&
+            s2b_bisect_full_kv == 0 && s2b_bisect_q_roundtrip == 0;
+        if (spec_pq) {
+            const int64_t n_blk = top_k->ne[0];
+            const bool s2b_active = kv_shard_dsa && llama_kv_shard_s2b();
+            ggml_tensor * own_g = nullptr;
+            if (s2b_active) {
+                GGML_ASSERT(inp->get_s2b_ownvec() != nullptr);
+                ggml_tensor * own_col = ggml_view_2d(ctx0, inp->get_s2b_ownvec(), 1, n_kv,
+                        inp->get_s2b_ownvec()->nb[1], 0);
+                ggml_set_name(own_col, "s2b_own_col");
+                llama_s2b_set_view_stride(own_col, inp->get_s2b_ownvec()->nb[2]);
+                own_g = ggml_get_rows_as(ctx0, own_col, idx, GGML_TYPE_F16);
+                GGML_ASSERT(inp->get_s2b_cache_size() <= INT32_MAX);
+                ggml_format_name(own_g, "s2b_own_g_%lld", (long long) inp->get_s2b_cache_size());
+                own_g = ggml_reshape_4d(ctx0, own_g, n_out, 1, 1, n_stream);
+            }
+            ggml_tensor * m_zero = ggml_fill(ctx0,
+                ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_blk, kq_mask->ne[1], 1, 1), 0.0f);
+            if (s2b_active) {
+                // T per-query partials, ONE cross-member exchange: concat the
+                // partial results [DV+2, H, 1, 2] along dim2 so the single
+                // concat node is the PARTIAL allreduce boundary (~263KB*T,
+                // fits the graph-mode slot), then one combine + the batched
+                // member-half tail exactly like the single-call path.
+                // Batched per-query FA via the FA batch (sequence) dim:
+                // sequence t = query t attending its own contiguous 2048-row
+                // gathered block. ONE partial launch per layer; dst is
+                // directly [DV+2, H, T, 2] (the former concat shape).
+                GGML_ASSERT(k_g->type == GGML_TYPE_F16);
+                ggml_tensor * q_b = ggml_view_4d(ctx0, q, q->ne[0], 1, q->ne[1], n_tokens,
+                        q->nb[1], q->nb[1], q->nb[2], 0);
+                ggml_tensor * k_b = ggml_view_4d(ctx0, k_g, k_g->ne[0], n_blk, 1, n_tokens,
+                        k_g->nb[2], k_g->nb[3], n_blk*k_g->nb[2], 0);
+                ggml_tensor * v_b = ggml_view_4d(ctx0, k_g, n_embd_v, n_blk, 1, n_tokens,
+                        k_g->nb[2], k_g->nb[3], n_blk*k_g->nb[2], 0);
+                ggml_tensor * m_b;
+                if (own_g != nullptr) {
+                    // single repeat instead of fill+add: broadcast the per-row
+                    // ownership column over the padded query rows
+                    ggml_tensor * own_b = ggml_view_4d(ctx0, own_g, n_blk, 1, 1, n_tokens,
+                            own_g->nb[1], own_g->nb[2], n_blk*own_g->nb[0], 0);
+                    m_b = ggml_repeat_4d(ctx0, own_b, n_blk, kq_mask->ne[1], 1, n_tokens);
+                    ggml_format_name(m_b, "s2b_mask-%d", il);
+                } else {
+                    m_b = ggml_fill(ctx0,
+                        ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_blk, kq_mask->ne[1], 1, n_tokens), 0.0f);
+                }
+                // slot count MUST come from the raw cache tensor (k_raw): its
+                // view_src still carries the meta buffer. `k` is the gathered
+                // cont whose buffer is unset at build time, so passing it hits
+                // the single-device fallback of 2 and silently DROPS members
+                // >= 2 on larger TP groups (their epilogue writes also land
+                // past the 2-slot dst).
+                ggml_tensor * parts = ggml_flash_attn_partial(ctx0, q_b, k_b, v_b, m_b, nullptr,
+                        kq_scale, hparams.f_max_alibi_bias,
+                        hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
+                        llama_s2b_n_slots(k_raw));
+                ggml_format_name(parts, "s2b_parts-%d", il);
+                cur = ggml_flash_attn_combine(ctx0, parts);
+                if (v_mla) {
+                    ggml_tensor * cur_member = ggml_view_4d(ctx0, cur,
+                            cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                            cur->nb[1], cur->nb[2], cur->nb[3], 0);
+                    ggml_set_name(cur_member, "s2b_memb_q");
+                    llama_s2b_set_view_stride(cur_member, cur->nb[1]*(size_t) cur->ne[1]/2);
+                    cur = cur_member;
+                    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                    cur = ggml_mul_mat(ctx0, v_mla, cur);
+                    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                    cur = ggml_cont(ctx0, cur);
+                }
+                cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            } else {
+                cur = nullptr;
+                for (int64_t t = 0; t < n_tokens; ++t) {
+                    ggml_tensor * q_t = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], 1, 1,
+                            q->nb[1], q->nb[2], q->nb[3], t*q->nb[2]);
+                    ggml_tensor * k_t = ggml_view_4d(ctx0, k_g, k_g->ne[0], 1, n_blk, 1,
+                            k_g->nb[1], k_g->nb[2], k_g->nb[3], t*n_blk*k_g->nb[2]);
+                    ggml_tensor * v_t = ggml_view_4d(ctx0, k_g, n_embd_v, 1, n_blk, 1,
+                            k_g->nb[1], k_g->nb[2], k_g->nb[3], t*n_blk*k_g->nb[2]);
+                    ggml_tensor * cur_t = build_attn_mha(q_t, k_t, v_t, kq_b, m_zero, sinks, v_mla, kq_scale, il);
+                    cur = cur == nullptr ? cur_t : ggml_concat(ctx0, cur, cur_t, 1);
+                }
+            }
+        } else if (kv_shard_dsa && llama_kv_shard_s2b()) {
+            GGML_ASSERT(n_stream == 1);
+            GGML_ASSERT(kq_b == nullptr);
+            GGML_ASSERT(sinks == nullptr);
+            GGML_ASSERT(inp->get_s2b_ownvec() != nullptr);
+
+            if (s2b_bisect_full_kv != 1) {
+                ggml_tensor * own_col = ggml_view_2d(ctx0, inp->get_s2b_ownvec(), 1, n_kv,
+                        inp->get_s2b_ownvec()->nb[1], 0);
+                ggml_set_name(own_col, "s2b_own_col");
+                llama_s2b_set_view_stride(own_col, inp->get_s2b_ownvec()->nb[2]);
+
+                ggml_tensor * own_g = ggml_get_rows_as(ctx0, own_col, idx, GGML_TYPE_F16);
+                GGML_ASSERT(inp->get_s2b_cache_size() <= INT32_MAX);
+                ggml_format_name(own_g, "s2b_own_g_%lld",
+                        (long long) inp->get_s2b_cache_size());
+                GGML_ASSERT(own_g->ne[0] == 1 && own_g->ne[1] == n_out);
+                GGML_ASSERT(own_g->ne[2] == n_stream && own_g->ne[3] == 1);
+                // [1,n_out] and [n_out,1] have identical contiguous storage.
+                // Reshape is a view; ADD natively broadcasts this column over
+                // padded query rows. This removes CONT, REPEAT, and CAST.
+                own_g = ggml_reshape_4d(ctx0, own_g, n_out, 1, 1, n_stream);
+                m_g = ggml_add(ctx0, m_g, own_g);
+                ggml_format_name(m_g, "s2b_mask-%d", il);
+            }
+
+            // wq_b/wk_b are MIRRORED for S2b target layers: q arrives with ALL
+            // heads on every member - no Q exchange at all. Feed the FA-layout
+            // permuted view straight into the partial kernel (same strided-Q
+            // handling as the dense flash-attention path).
+            ggml_tensor * q_fa = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2], 1,
+                    q->nb[1], q->nb[2], q->nb[3], 0);
+            q_fa = ggml_permute(ctx0, q_fa, 0, 2, 1, 3);
+            ggml_tensor * k_fa = nullptr;
+            ggml_tensor * v_fa = nullptr;
+
+            if (s2b_bisect_q_roundtrip != 0) {
+                // Dense control inside the S2b-enabled model: this member's
+                // head half of the mirrored Q through the proven dense path
+                // (matches the head-split shapes v_mla/wo expect downstream).
+                ggml_tensor * q_member = ggml_view_4d(ctx0, q,
+                        q->ne[0], q->ne[1], q->ne[2], q->ne[3],
+                        q->nb[1], q->nb[2], q->nb[3], 0);
+                ggml_set_name(q_member, "s2b_memb_q");
+                llama_s2b_set_view_stride(q_member, q->nb[1]*(size_t) q->ne[1]/2);
+                cur = build_attn_mha(q_member, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+                goto s2b_attention_done;
+            }
+
+            k_fa = ggml_permute(ctx0, k_g, 0, 2, 1, 3);
+            v_fa = ggml_permute(ctx0, v_g, 0, 2, 1, 3);
+            if (k_fa->type == GGML_TYPE_F32) {
+                k_fa = ggml_cast(ctx0, k_fa, GGML_TYPE_F16);
+            }
+            if (v_fa->type == GGML_TYPE_F32) {
+                v_fa = ggml_cast(ctx0, v_fa, GGML_TYPE_F16);
+            }
+
+            // k_raw, not k: see the batched-verify callsite - the gathered
+            // cont has no buffer at build time and would yield the 2-slot
+            // fallback, dropping members >= 2 on larger TP groups.
+            cur = ggml_flash_attn_partial(ctx0, q_fa, k_fa, v_fa, m_g, nullptr,
+                    kq_scale, hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
+                    llama_s2b_n_slots(k_raw));
+            ggml_format_name(cur, "s2b_partial-%d", il);
+            cur = ggml_flash_attn_combine(ctx0, cur);
+
+            if (v_mla) {
+                // The combine result is mirrored because both members need all
+                // query heads while reducing their disjoint KV-position
+                // partials. Select the local head half only after that reduce,
+                // so it matches the axis-2-sharded MLA value projection.
+                ggml_tensor * cur_member = ggml_view_4d(ctx0, cur,
+                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                        cur->nb[1], cur->nb[2], cur->nb[3], 0);
+                ggml_set_name(cur_member, "s2b_memb_q");
+                llama_s2b_set_view_stride(cur_member, cur->nb[1]*(size_t) cur->ne[1]/2);
+                cur = cur_member;
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                cur = ggml_mul_mat(ctx0, v_mla, cur);
+                cb(cur, "fattn_mla", il);
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+s2b_attention_done:;
+        } else {
+            cur = build_attn_mha(q, k_g, v_g, kq_b, m_g, sinks, v_mla, kq_scale, il);
+        }
     } else {
+        // LLAMA_S2B_PREFILL: prefill/dense attention without the full-KV
+        // gather. Each member runs the partial-FA kernel over ITS OWN
+        // contiguous position slice of the RAW sharded cache (an op consuming
+        // the sharded view computes on the local slice) with the matching row
+        // slice of the mirrored kq mask; the s2b_parts- boundary allgather +
+        // log-sum-exp combine reproduce dense attention exactly. Gated on the
+        // meta path: on a single device the raw cache is not sharded and the
+        // regular gather+dense path below is already correct.
+        const ggml_tensor * kr_root = k_raw->view_src != nullptr ? k_raw->view_src : k_raw;
+        const bool s2b_pf = llama_s2b_prefill() && kv_shard_dsa && llama_kv_shard_s2b() &&
+                kr_root->buffer != nullptr && ggml_backend_buffer_is_meta(kr_root->buffer) &&
+                ggml_backend_meta_buffer_n_bufs(kr_root->buffer) >= 2;
+        if (s2b_pf) {
+            GGML_ASSERT(k_raw->ne[3] == 1);
+            GGML_ASSERT(kq_b  == nullptr);
+            GGML_ASSERT(sinks == nullptr);
+
+            // wq_b is MIRRORED for S2b target layers: q arrives with ALL heads
+            // on every member - feed the FA-layout permuted view directly.
+            ggml_tensor * q_fa = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2], 1,
+                    q->nb[1], q->nb[2], q->nb[3], 0);
+            q_fa = ggml_permute(ctx0, q_fa, 0, 2, 1, 3);
+
+            // Named view of the raw sharded cache: NO kvgather cont. Cells
+            // fill SEQUENTIALLY across the member-contiguous cache quarters,
+            // so the meta backend derives per-member extents by sequential
+            // fill (member j holds cells [base_j, base_j+take_j) of the first
+            // n_kv rows; late members can be EMPTY) - see "s2b_pfk" in
+            // ggml-backend-meta.cpp. A plain view would distribute the rows
+            // proportionally, which mismatches ownership (the S1 lesson).
+            // V is the row prefix of K and inherits the same extents.
+            ggml_tensor * k_pf = ggml_view_4d(ctx0, k_raw,
+                    k_raw->ne[0], k_raw->ne[1], k_raw->ne[2], k_raw->ne[3],
+                    k_raw->nb[1], k_raw->nb[2], k_raw->nb[3], 0);
+            ggml_set_name(k_pf, "s2b_pfk");
+            ggml_tensor * k_fa = ggml_permute(ctx0, k_pf, 0, 2, 1, 3);
+            ggml_tensor * v_pf = ggml_view_4d(ctx0, k_pf, v_cur->ne[0],
+                    k_pf->ne[1], k_pf->ne[2], k_pf->ne[3],
+                    k_pf->nb[1], k_pf->nb[2], k_pf->nb[3], 0);
+            ggml_tensor * v_fa = ggml_permute(ctx0, v_pf, 0, 2, 1, 3);
+
+            // Phase-2 mask split: the dedicated s2bpf input is stored
+            // per-member as only that member's cache-share row slice (AXIS_0
+            // meta split keyed on the "kq_mask_s2bpf_" name); the meta rebuild
+            // then leaves op_params[9] = 0. Fallback (input absent, e.g.
+            // non-FA): full mirrored mask + injected per-member column base
+            // op_params[9], as in phase 1.
+            //
+            // slot count MUST come from the raw cache view (its view_src
+            // carries the meta buffer; a fresh cont has no buffer at build
+            // time and would silently fall back to 2 slots)
+            ggml_tensor * m_pf = inp->self_kq_mask_s2bpf != nullptr ? inp->self_kq_mask_s2bpf : kq_mask;
+            cur = ggml_flash_attn_partial(ctx0, q_fa, k_fa, v_fa, m_pf, nullptr,
+                    kq_scale, hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
+                    llama_s2b_n_slots(k_raw));
+            ggml_format_name(cur, "s2b_parts-%d", il);
+            // Each member consumes only its own head slice of the combine
+            // output (s2b_memb_q below), and the combine is row (head,
+            // token)-independent with all-zero rows neutral: op_params[10]
+            // tells the boundary exchange it may ship only the consumer's
+            // head slice of each foreign slot (wire /n_members).
+            // LLAMA_S2B_HEADSLICE=0 is the full-slot-exchange kill switch.
+            static const bool s2b_headslice = []() {
+                const char * e = getenv("LLAMA_S2B_HEADSLICE");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            if (v_mla && s2b_headslice) {
+                cur->op_params[10] = 1;
+            }
+            cur = ggml_flash_attn_combine(ctx0, cur);
+
+            if (v_mla) {
+                // The combine result is mirrored because every member needs all
+                // query heads while reducing their disjoint KV-position
+                // partials. Select the local head share only after that reduce,
+                // so it matches the axis-2-sharded MLA value projection.
+                ggml_tensor * cur_member = ggml_view_4d(ctx0, cur,
+                        cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3],
+                        cur->nb[1], cur->nb[2], cur->nb[3], 0);
+                ggml_set_name(cur_member, "s2b_memb_q");
+                llama_s2b_set_view_stride(cur_member, cur->nb[1]*(size_t) cur->ne[1]/2);
+                cur = cur_member;
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                cur = ggml_mul_mat(ctx0, v_mla, cur);
+                cb(cur, "fattn_mla", il);
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        } else {
         // prefill (or n_kv <= top_k): dense causal attention over the full KV cache
-        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+        ggml_tensor * q_used = q;
+        if (kv_shard_dsa && llama_kv_shard_s2b()) {
+            // Target-layer wq_b/wk_b are MIRRORED under S2b (full-head Q on
+            // every member). Slice this member's head half so prefill FA does
+            // not double and the head-split v_mla/wo downstream see the same
+            // shapes as the plain head-split build.
+            ggml_tensor * q_member = ggml_view_4d(ctx0, q,
+                    q->ne[0], q->ne[1], q->ne[2], q->ne[3],
+                    q->nb[1], q->nb[2], q->nb[3], 0);
+            ggml_set_name(q_member, "s2b_memb_q");
+            llama_s2b_set_view_stride(q_member, q->nb[1]*(size_t) q->ne[1]/2);
+            q_used = q_member;
+        }
+        cur = build_attn_mha(q_used, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+        }
     }
     cb(cur, "kqv_out", il);
 
@@ -3222,10 +3603,37 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     // stays dense.
     if (n_tokens > 1 && n_tokens <= (int64_t) llama_sparse_spec_ntok() &&
             hparams.indexer_top_k > 0 && inp->self_kq_mask_mla->ne[3] == 1) {
+        // Shared-top-k verify: every query in the batch shares the NEWEST
+        // query's top-k set plus the batch's own T rows appended explicitly.
+        // Mask is [top_k + n_tokens, n_q_pad]: the top_k region is fully
+        // visible (per-row corrections come from the tail-collision and
+        // ownership masks), the tail region is causal within the batch.
         inp->self_kq_mask_spec = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16,
                 (int64_t) hparams.indexer_top_k * n_tokens, inp->self_kq_mask_mla->ne[1], 1, 1);
         ggml_set_input(inp->self_kq_mask_spec);
         ggml_format_name(inp->self_kq_mask_spec, "kq_mask_spec");
+    }
+
+    if (llama_kv_shard_s2b()) {
+        inp->s2b_cache_size = mctx_cur->get_mla()->get_size();
+        inp->self_s2b_ownvec = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32,
+                1, inp->self_kq_mask_mla->ne[0], LLAMA_S2B_OWNVEC_SLOTS);
+        ggml_set_input(inp->self_s2b_ownvec);
+        ggml_set_name(inp->self_s2b_ownvec, "s2b_ownvec");
+
+        // S2b-at-prefill phase-2 mask split: dedicated mask input for the
+        // partial-prefill branch. The NAME carries the MLA cache size: it is
+        // the only channel to the meta split-state derivation (an input leaf
+        // has no source path to the cache tensor - the sched even replaces it
+        // per stage with a fresh "<backend>#kq_mask_s2bpf_<cache>#<copy>" dup
+        // leaf, so a named view would get leaf-ified and never split). Only
+        // the s2b prefill branch consumes it; in decode graphs it stays
+        // unconsumed -> unallocated (set_input skips it via the buffer guard).
+        if (llama_s2b_prefill() && cparams.flash_attn) {
+            ggml_tensor * m = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
+            ggml_format_name(m, "kq_mask_s2bpf_%lld", (long long) inp->s2b_cache_size);
+            inp->self_kq_mask_s2bpf = m;
+        }
     }
 
     return (llm_graph_input_attn_k_dsa *) res->add_input(std::move(inp));

@@ -409,6 +409,9 @@ public:
     ggml_tensor * get_kq_mask_mla() const { return self_kq_mask_mla_cnv; }
     ggml_tensor * get_kq_mask_lid() const { return self_kq_mask_lid; }
     ggml_tensor * get_kq_mask_spec() const { return self_kq_mask_spec; }
+    ggml_tensor * get_spec_tail()    const { return self_spec_tail; }
+    ggml_tensor * get_s2b_ownvec() const { return self_s2b_ownvec; }
+    int64_t get_s2b_cache_size() const { return s2b_cache_size; }
 
     ggml_tensor * self_k_idxs_mla = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_lid = nullptr; // I64 [n_batch]
@@ -422,6 +425,16 @@ public:
     // block-diagonal F16 mask [n_tokens*top_k, n_q_pad, 1, 1] - query t attends only
     // its own gathered top-k block; filled host-side in set_input
     ggml_tensor * self_kq_mask_spec = nullptr;
+    ggml_tensor * self_spec_tail    = nullptr; // I32 [n_tokens] batch-tail cache rows
+    ggml_tensor * self_s2b_ownvec   = nullptr; // F32 [1, n_kv, 2]
+    int64_t       s2b_cache_size    = 0;
+
+    // S2b-at-prefill (LLAMA_S2B_PREFILL) phase-2 mask split: dedicated mask
+    // input for the partial-prefill branch. Named "kq_mask_s2bpf_<cache>";
+    // the meta backend keys an AXIS_0 per-member row-slice split on that name
+    // so each member stores only its cache-share columns (the /N memory win).
+    // self_kq_mask_mla stays full-size mirrored for all other consumers.
+    ggml_tensor * self_kq_mask_s2bpf = nullptr; // F16 [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot_lid = nullptr;
 

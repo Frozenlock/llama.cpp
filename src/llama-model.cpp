@@ -332,16 +332,33 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+// from ggml-backend-impl.h (not on this target's include path)
+extern "C" {
+    bool   ggml_backend_buffer_is_meta    (ggml_backend_buffer_t buf);
+    size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf);
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+
+    // Mixed-size TP groups (e.g. 4+4+4+2 over 14 GPUs): shares must be computed
+    // for the member count of the group that owns this tensor. The tensor's meta
+    // buffer is the authority; ud->n_devices is only a fallback and equals the
+    // group size anyway when all groups are uniform.
+    const size_t n_members = (tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer))
+        ? ggml_backend_meta_buffer_n_bufs(tensor->buffer) : ud->n_devices;
 
     // LLAMA_KV_SHARD=1: block-cyclic position shard of the MLA latent KV
     // cache across pair members (halves per-member KV memory; see
     // ~/KV-SHARD-DESIGN.md). Default off.
     static const bool kv_shard = [] {
         const char * e = getenv("LLAMA_KV_SHARD");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static const bool kv_shard_s2b = [] {
+        const char * e = getenv("LLAMA_KV_SHARD_S2B");
         return e != nullptr && atoi(e) != 0;
     }();
 
@@ -417,16 +434,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_il_eff(il) % n_members;
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_il_eff(il) % n_members;
         } else {
             il = 0;
-            rotation = hparams.n_layer() % ud->n_devices;
+            rotation = hparams.n_layer() % n_members;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
@@ -452,28 +469,39 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 #else
-        // S2b partial-attention decode (LLAMA_KV_SHARD_S2B): every member must
-        // hold ALL query heads so each can attend over its own KV position
-        // shard (partials merged via log-sum-exp) - mirror wq_b and the k_b
-        // absorb matrix. wv_b stays head-split: the combine output is
-        // mirrored, so per-member v_mla decompression of its own heads feeds
-        // the row-split wo like today.
-        static const bool kv_shard_s2b = [](){
-            const char * e = getenv("LLAMA_KV_SHARD_S2B");
-            return e != nullptr && atoi(e) != 0;
-        }();
+        // S2b partial-attention (LLAMA_KV_SHARD_S2B): every member holds ALL
+        // query heads so it can attend over its own KV position shard, the
+        // partials merged via log-sum-exp - mirror wq_b and the k_b absorb
+        // matrix. This removes the per-layer Q exchange entirely. The
+        // nextn/MTP draft layer keeps the standard head split: its graph path
+        // (plain attn_k input) consumes head-split Q. wv_b stays head-split
+        // everywhere: the combine output is mirrored, so per-member v_mla of
+        // its own heads feeds the row-split wo like today.
+        const bool s2b_target_layer = kv_shard && kv_shard_s2b &&
+                tensor_name.substr(0, 4) == "blk." &&
+                std::stoul(tensor_name.substr(4)) < hparams.n_layer();
         if (std::regex_match(tensor_name, pattern_mla_q_b)) {
-            if (kv_shard && kv_shard_s2b) {
+            if (s2b_target_layer) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            // S2b consumes member chunks in device order. Keep the global head
+            // halves on stable members instead of rotating them every layer.
+            if (kv_shard_s2b) {
+                tc.rotation = 0;
+            }
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_mla_kv_b)) {
-            if (kv_shard && kv_shard_s2b && tensor_name.find("attn_k_b") != std::string::npos) {
+            if (s2b_target_layer && tensor_name.find("attn_k_b") != std::string::npos) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             // 3D tensors {*, *, n_head}: split on the head axis
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            if (kv_shard_s2b) {
+                tc.rotation = 0;
+            }
+            return tc;
         }
 #endif
         if (hparams.is_mla() && std::regex_match(tensor_name, pattern_kv_cache)) {
@@ -544,7 +572,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            if (kv_shard_s2b && hparams.is_mla()) {
+                tc.rotation = 0;
+            }
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_attn_out_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -726,7 +758,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
             // to handle head sizes like 80, only increase granularity while it doesn't cause underutilization
             int64_t blck_size_perf = blck_size;
-            while (blck_size_perf < 128 && blck_size_perf*ud->n_devices < n_embd_q) {
+            while (blck_size_perf < 128 && blck_size_perf*n_members < n_embd_q) {
                 blck_size_perf *= 2;
             }
 
@@ -790,9 +822,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tensor_split = nullptr;
         }
         std::vector<float> tensor_split_scan;
-        tensor_split_scan.reserve(ud->n_devices);
-        for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+        tensor_split_scan.reserve(n_members);
+        for (size_t j = 0; j < n_members; j++) {
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % n_members]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -805,19 +837,39 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t  g_s  = granularity[is];
             int64_t low = 0;
             size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
+            for (; j < n_members - 1; j++) {
                 int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
+                    ne_s * (j+1)/n_members : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
                 if (high % g_s != 0) {
                     high -= high % g_s;
                 }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
+                split_state.ne[is*n_members + (j + tc.rotation) % n_members] = high - low;
                 low = high;
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
+            split_state.ne[is*n_members + (j + tc.rotation) % n_members] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
+        // LLAMA_SPLIT_DEBUG: dump per-member shares of the first tensors to
+        // diagnose group-size distribution bugs (TP4 bitrot hunt)
+        static const int split_debug = [](){
+            const char * e = getenv("LLAMA_SPLIT_DEBUG");
+            return e ? atoi(e) : 0;
+        }();
+        if (split_debug == 1 || (split_debug == 2 && tensor_name.find("_exps") != std::string::npos)) {
+            static int n_dumped = 0;
+            if (n_dumped < 400) {
+                n_dumped++;
+                char buf[256]; int off = 0;
+                for (size_t j = 0; j < n_members && off < 200; j++) {
+                    off += snprintf(buf + off, sizeof(buf) - off, "%lld ",
+                            (long long) split_state.ne[j]);
+                }
+                fprintf(stderr, "SPLITDBG %-40s axis=%d segs=%zu nr0=%u shares: %s\n",
+                        tensor_name.c_str(), (int) split_state.axis,
+                        segments.size(), (unsigned) split_state.nr[0], buf);
+            }
+        }
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
