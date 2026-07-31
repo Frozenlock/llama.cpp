@@ -450,6 +450,20 @@ struct server_slot {
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
         } else {
+            // Constant verify width: mixed draft lengths alternate ubatch
+            // widths, and on the sparse stack each width change re-plans the
+            // single galloc plan (~28ms) and resets outer-graph capture warmth.
+            // Pad short drafts by repeating the last token - padded positions
+            // ride the normal reject-rollback path, so output is unchanged.
+            static const int spec_pad = [](){
+                const char * e = getenv("LLAMA_SPEC_PAD_WIDTH");
+                return e ? atoi(e) : 3;
+            }();
+            const int pad_to = std::min(spec_pad, get_n_draft_max());
+            if ((int) spec_draft.size() < pad_to) {
+                spec_draft.resize(pad_to, spec_draft.back());
+            }
+
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
@@ -3928,6 +3942,27 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
+                // LLAMA_SPEC_TRACE=1: per-verify-step token trace (draft vs
+                // target-sampled), for pinning down state-dependent retrieval
+                // failures (are the wrong tokens drafted or argmax-computed?).
+                // Host-side only, inert unless the env is set.
+                static const bool spec_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+                if (spec_trace) {
+                    std::string ds, as;
+                    for (size_t k = 0; k < slot.spec_draft.size(); ++k) {
+                        ds += " " + std::to_string(slot.spec_draft[k]) +
+                              "'" + common_token_to_piece(slot.ctx_tgt, slot.spec_draft[k]) + "'";
+                    }
+                    for (size_t k = 0; k < accepted.size(); ++k) {
+                        as += " " + std::to_string(accepted[k]) +
+                              "'" + common_token_to_piece(slot.ctx_tgt, accepted[k]) + "'";
+                    }
+                    SLT_INF(slot, "[SPECTRACE] n_past=%d draft(%zu):%s | target(%zu):%s\n",
+                            slot.prompt.n_tokens(), slot.spec_draft.size(), ds.c_str(),
+                            accepted.size(), as.c_str());
+                }
+
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
