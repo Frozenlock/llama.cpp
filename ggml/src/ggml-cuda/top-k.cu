@@ -1,6 +1,8 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <unistd.h>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
@@ -59,7 +61,11 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // Guarded against active stream capture (sync is illegal mid-capture).
     static const int sp_dbg = [](){ const char * e = getenv("LLAMA_SPARSE_DEBUG"); return e ? atoi(e) : 0; }();
     static const long sp_pos = [](){ const char * e = getenv("LLAMA_SPARSE_DEBUG_POS"); return e ? atol(e) : -1; }();
-    if (sp_dbg > 0 && src0->name[0] != '\0' && strstr(src0->name, "indexer_score") != nullptr) {
+    // optional file gate (see LLAMA_SPARSE_TOPK_WATCH_GATE): dump only while
+    // <path> exists, so a specific request can be probed on demand
+    static const char * sp_gate = getenv("LLAMA_SPARSE_DEBUG_GATE");
+    if (sp_dbg > 0 && src0->name[0] != '\0' && strstr(src0->name, "indexer_score") != nullptr &&
+            (sp_gate == nullptr || access(sp_gate, F_OK) == 0)) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone) {
             static std::atomic<int> n_dumps{0};

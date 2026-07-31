@@ -6,6 +6,123 @@
 #include <cstring>
 #include <vector>
 
+#include <unistd.h>
+
+template <typename dst_t>
+static __global__ void k_s2b_ownership_mask(
+        const int32_t * __restrict__ idx, dst_t * __restrict__ dst,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t s10, const size_t s11, const size_t s12,
+        const size_t d1, const size_t d2, const size_t d3,
+        const int64_t shard_base, const int64_t shard_rows) {
+    const int64_t i10 = blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t z   = blockIdx.y;
+    if (i10 >= ne10 || z >= ne11*ne12) {
+        return;
+    }
+    const int64_t i11 = z % ne11;
+    const int64_t i12 = z / ne11;
+    const int64_t global_row = idx[i10*s10 + i11*s11 + i12*s12];
+    dst[i10*d1 + i11*d2 + i12*d3] = ggml_cuda_cast<dst_t>(
+        global_row >= shard_base && global_row < shard_base + shard_rows ? 0.0f : -INFINITY);
+}
+
+// Shared-top-k verify (mode 3): -inf for gathered rows that duplicate one of
+// the batch-tail rows (whose live copies are appended explicitly after the
+// shared top-k set) - without this a duplicated row would be double-counted
+// in the softmax. tail values come from src0 (an I32 input view, [1, n_tail]).
+template <typename dst_t>
+static __global__ void k_spec_tail_collision_mask(
+        const int32_t * __restrict__ tail, const int32_t * __restrict__ idx, dst_t * __restrict__ dst,
+        const int64_t ne10, const int64_t n_tail,
+        const size_t s10, const size_t d1) {
+    const int64_t i10 = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i10 >= ne10) {
+        return;
+    }
+    const int32_t v = idx[i10*s10];
+    float out = 0.0f;
+    for (int64_t t = 0; t < n_tail; ++t) {
+        if (tail[t] == v) {
+            out = -INFINITY;
+            break;
+        }
+    }
+    dst[i10*d1] = ggml_cuda_cast<dst_t>(out);
+}
+
+// S2b's hot gather is Q8_0 -> F16 with 576 values per selected row.  The
+// generic quantized get_rows kernel assigns a whole 256-thread block to one
+// row and needs two column tiles, producing 2*n_sel tiny blocks.  Decode is
+// launch/topology bound on the TP2xPP7 3090 setup, so instead assign one warp
+// to each complete row: eight rows per block and 16x fewer blocks at n_sel =
+// 2048, while preserving the exact dequantization and foreign-row zero fill.
+static __global__ void k_s2b_get_rows_q8_0_f16_warp(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, half * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12,
+        const int64_t shard_base, const int64_t shard_rows) {
+    constexpr int warps_per_block = 256/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t i10 = (int64_t) blockIdx.x*warps_per_block + warp;
+    const int64_t z = blockIdx.y;
+
+    if (i10 >= ne10 || z >= ne11*ne12) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    const int64_t i11 = z % ne11;
+    const int64_t i12 = z / ne11;
+    int64_t i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    half * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+    i01 -= shard_base;
+    if (i01 < 0 || i01 >= shard_rows) {
+        for (int64_t i00 = lane; i00 < ne00; i00 += WARP_SIZE) {
+            dst_row[i00] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+    for (int64_t i00 = 2*lane; i00 < ne00; i00 += 2*WARP_SIZE) {
+        const int ib  = i00/QK8_0;
+        const int iqs = i00 % QK8_0;
+        float2 v;
+        dequantize_q8_0(src0_row, ib, iqs, v);
+        dst_row[i00 + 0] = __float2half(v.x);
+        if (i00 + 1 < ne00) {
+            dst_row[i00 + 1] = __float2half(v.y);
+        }
+    }
+}
+
+static void get_rows_cuda_s2b_q8_0_f16_warp(
+        const void * src0_d, const int32_t * src1_d, half * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream, const int64_t shard_base, const int64_t shard_rows) {
+    constexpr int threads = 256;
+    constexpr int warps_per_block = threads/WARP_SIZE;
+    const dim3 blocks((unsigned) ((ne10 + warps_per_block - 1)/warps_per_block),
+                      (unsigned) (ne11*ne12), 1);
+    k_s2b_get_rows_q8_0_f16_warp<<<blocks, threads, 0, stream>>>(
+        src0_d, src1_d, dst_d,
+        ne00, ne10, ne11, ne12,
+        nb1/sizeof(half), nb2/sizeof(half), nb3/sizeof(half),
+        nb01, nb02, nb03,
+        nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t),
+        shard_base, shard_rows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -267,6 +384,19 @@ void get_rows_cuda(
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
         cudaStream_t stream, int64_t shard_base, int64_t shard_rows) {
+    static const bool s2b_warp_gather = []() {
+        const char * e = getenv("LLAMA_S2B_WARP_GATHER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (s2b_warp_gather && shard_rows > 0 &&
+            src0_type == GGML_TYPE_Q8_0 && dst_type == GGML_TYPE_F16) {
+        get_rows_cuda_s2b_q8_0_f16_warp(
+            src0_d, src1_d, (half *) dst_d,
+            ne00, nb01, nb02, nb03,
+            ne10, ne11, ne12, nb10, nb11, nb12,
+            nb1, nb2, nb3, stream, shard_base, shard_rows);
+        return;
+    }
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,
@@ -336,6 +466,103 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
+    // LLAMA_SPARSE_TOPK_WATCH="lo:hi[:max_prints]": per-launch count of DSA
+    // top-k gather indices falling in cell range [lo,hi). Discriminates
+    // selection-side failures (needle cells never selected) from
+    // attention/gather-side failures (selected but dropped) on eager (non-
+    // captured) passes. Inert unless the env is set.
+    {
+        static const auto watch = []() -> std::tuple<int32_t,int32_t,int> {
+            const char * e = getenv("LLAMA_SPARSE_TOPK_WATCH");
+            if (e == nullptr) return {0, 0, 0};
+            int32_t lo = 0, hi = 0; int mx = 64;
+            if (sscanf(e, "%d:%d:%d", &lo, &hi, &mx) >= 2 && hi > lo) return {lo, hi, mx};
+            return {0, 0, 0};
+        }();
+        const auto [w_lo, w_hi, w_max] = watch;
+        // optional file gate (LLAMA_SPARSE_TOPK_WATCH_GATE=<path>): watch (and
+        // its per-launch device sync) is active only while <path> exists, so a
+        // specific request can be instrumented without perturbing the ones
+        // before it (state-dependent bugs may hide under the extra syncs).
+        static const char * w_gate = getenv("LLAMA_SPARSE_TOPK_WATCH_GATE");
+        cudaStreamCaptureStatus w_cs = cudaStreamCaptureStatusNone;
+        if (w_hi > w_lo && src1->name[0] != '\0' && strstr(src1->name, "top_k") != nullptr &&
+                (w_gate == nullptr || access(w_gate, F_OK) == 0) &&
+                cudaStreamIsCapturing(stream, &w_cs) == cudaSuccess && w_cs == cudaStreamCaptureStatusNone) {
+            static std::atomic<int> n_watch{0};
+            if (n_watch.fetch_add(1) < w_max) {
+                const int64_t n_idx = ggml_nelements(src1);
+                std::vector<int32_t> h((size_t) n_idx);
+                CUDA_CHECK(cudaMemcpyAsync(h.data(), src1->data, h.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                int64_t in_range = 0; int32_t mn = INT32_MAX, mx2 = INT32_MIN;
+                for (int64_t i = 0; i < n_idx; i++) {
+                    if (h[(size_t) i] >= w_lo && h[(size_t) i] < w_hi) in_range++;
+                    mn = std::min(mn, h[(size_t) i]); mx2 = std::max(mx2, h[(size_t) i]);
+                }
+                int w_dev = -1; cudaGetDevice(&w_dev);
+                fprintf(stderr, "[TOPKWATCH] dev=%d dst=%s n_idx=%lld watch=[%d,%d) hit=%lld min=%d max=%d\n",
+                        w_dev, dst->name, (long long) n_idx, w_lo, w_hi, (long long) in_range, mn, mx2);
+                fflush(stderr);
+            }
+        }
+    }
+
+    // LLAMA_CACHE_ROWSUM="lo:hi[:max]": FNV checksum of RAW cache rows
+    // [lo,hi) of src0 (the sharded MLA cache) on eager top-k gather launches.
+    // Bit-identical prompts must give bit-identical row sums; a mismatch
+    // between a failing and a passing run of the SAME prompt pins the
+    // corruption on the cache WRITE side (prefill set_rows), an identical sum
+    // pins it on the compute/exchange side. Optional file gate via
+    // LLAMA_SPARSE_TOPK_WATCH_GATE (same file as the top-k watch).
+    {
+        static const auto rowsum = []() -> std::tuple<int64_t,int64_t,int> {
+            const char * e = getenv("LLAMA_CACHE_ROWSUM");
+            if (e == nullptr) return {0, 0, 0};
+            long lo = 0, hi = 0; int mx = 64;
+            if (sscanf(e, "%ld:%ld:%d", &lo, &hi, &mx) >= 2 && hi > lo) return {lo, hi, mx};
+            return {0, 0, 0};
+        }();
+        const auto [r_lo, r_hi, r_max] = rowsum;
+        static const char * r_gate = getenv("LLAMA_SPARSE_TOPK_WATCH_GATE");
+        cudaStreamCaptureStatus r_cs = cudaStreamCaptureStatusNone;
+        // member-0 raw cache only (sh_base == 0): its LOCAL rows equal global
+        // cell ids, and the checked range must be inside its owned extent.
+        // src0's view ne[1] is proportionally distributed and cannot be used
+        // as a bound (that is what op_params[2] is for).
+        const int32_t r_mode = ((const int32_t *) dst->op_params)[1];
+        const int32_t r_base = ((const int32_t *) dst->op_params)[0];
+        const int32_t r_rows = ((const int32_t *) dst->op_params)[2];
+        if (r_hi > r_lo && src1->name[0] != '\0' && strstr(src1->name, "top_k") != nullptr &&
+                strncmp(dst->name, "s2b_local_k-", 12) == 0 &&
+                (r_gate == nullptr || access(r_gate, F_OK) == 0) &&
+                r_mode == 1 && r_base == 0 && (int64_t) r_rows >= r_hi &&
+                cudaStreamIsCapturing(stream, &r_cs) == cudaSuccess && r_cs == cudaStreamCaptureStatusNone) {
+            static std::atomic<int> n_sums{0};
+            if (n_sums.fetch_add(1) < r_max) {
+                const int64_t n_rows = r_hi - r_lo;
+                std::vector<uint8_t> h((size_t) (n_rows*nb01));
+                CUDA_CHECK(cudaMemcpyAsync(h.data(), (const char *) src0->data + r_lo*nb01,
+                        h.size(), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                int r_dev = -1; cudaGetDevice(&r_dev);
+                fprintf(stderr, "[ROWSUM] dev=%d dst=%s rows=[%lld,%lld) nb01=%zu sums:",
+                        r_dev, dst->name, (long long) r_lo, (long long) r_hi, (size_t) nb01);
+                for (int64_t b = 0; b < n_rows; b += 16) {
+                    uint64_t f = 1469598103934665603ULL;
+                    const size_t lo_b = (size_t) (b*nb01);
+                    const size_t hi_b = std::min(h.size(), (size_t) ((b + 16)*nb01));
+                    for (size_t k = lo_b; k < hi_b; k++) {
+                        f = (f ^ h[k]) * 1099511628211ULL;
+                    }
+                    fprintf(stderr, " %lld:%08x", (long long) (r_lo + b), (uint32_t) (f & 0xffffffff));
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+    }
+
     // KV-shard sparse gather (meta-injected op_params): [0]=member row base,
     // [1]=shard mode flag; rebase + zero-fill foreign rows (see meta backend)
     const int32_t sh_mode = ((const int32_t *) dst->op_params)[1];
@@ -344,8 +571,184 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // proportionally-distributed ne01
     const int64_t sh_rows = sh_mode != 0 ? ((const int32_t *) dst->op_params)[2] : 0;
 
-    get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
-        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, sh_base, sh_rows);
+    if (sh_mode == 2) {
+        GGML_ASSERT(ne00 == 1 &&
+            (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16));
+        const int threads = 256;
+        const dim3 blocks((unsigned) ((ne10 + threads - 1)/threads),
+                          (unsigned) (ne11*ne12), 1);
+        if (dst->type == GGML_TYPE_F16) {
+            k_s2b_ownership_mask<<<blocks, threads, 0, stream>>>(
+                (const int32_t *) src1->data, (half *) dst->data,
+                ne10, ne11, ne12,
+                nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t),
+                nb1/sizeof(half), nb2/sizeof(half), nb3/sizeof(half),
+                sh_base, sh_rows);
+        } else {
+            k_s2b_ownership_mask<<<blocks, threads, 0, stream>>>(
+                (const int32_t *) src1->data, (float *) dst->data,
+                ne10, ne11, ne12,
+                nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t),
+                nb1/sizeof(float), nb2/sizeof(float), nb3/sizeof(float),
+                sh_base, sh_rows);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        // LLAMA_S2B_AUDIT2: per-device dump of the generated-ownership-mask
+        // inputs (top-k idx identity across members + owned counts). First 8
+        // launches per device (covers ~2 decode steps on the tiny model).
+        static const bool s2b_audit2 = getenv("LLAMA_S2B_AUDIT2") != nullptr;
+        if (s2b_audit2) {
+            static std::atomic<int> a2_count[GGML_CUDA_MAX_DEVICES];
+            int dev = -1;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (dev >= 0 && dev < GGML_CUDA_MAX_DEVICES &&
+                    cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
+                    capture == cudaStreamCaptureStatusNone &&
+                    a2_count[dev].fetch_add(1) < 8) {
+                const int64_t n_idx = ne10*ne11*ne12;
+                std::vector<int32_t> hidx((size_t) n_idx);
+                CUDA_CHECK(cudaMemcpyAsync(hidx.data(), src1->data, hidx.size()*sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                uint64_t fnv = 1469598103934665603ULL;
+                int64_t owned = 0;
+                int32_t mn = INT32_MAX, mx = INT32_MIN;
+                for (int64_t i = 0; i < n_idx; ++i) {
+                    fnv = (fnv ^ (uint32_t) hidx[(size_t) i]) * 1099511628211ULL;
+                    mn = std::min(mn, hidx[(size_t) i]);
+                    mx = std::max(mx, hidx[(size_t) i]);
+                    if (hidx[(size_t) i] >= sh_base && hidx[(size_t) i] < sh_base + sh_rows) {
+                        owned++;
+                    }
+                }
+                fprintf(stderr,
+                        "[S2BAUDIT2-OWNGEN] dev=%d name=%s base=%lld rows=%lld n_idx=%lld owned=%lld min=%d max=%d idxhash=%016llx\n",
+                        dev, dst->name, (long long) sh_base, (long long) sh_rows,
+                        (long long) n_idx, (long long) owned, mn, mx,
+                        (unsigned long long) fnv);
+                fflush(stderr);
+            }
+        }
+        static const bool s2b_audit_own = getenv("LLAMA_S2B_AUDIT") != nullptr;
+        if (s2b_audit_own && dst->type == GGML_TYPE_F32) {
+            static std::atomic<uint32_t> audited_devices{0};
+            int dev = -1;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            const uint32_t bit = dev >= 0 && dev < 32 ? 1u << dev : 0;
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (bit != 0 && cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
+                    capture == cudaStreamCaptureStatusNone &&
+                    (audited_devices.fetch_or(bit) & bit) == 0) {
+                std::vector<float> h((size_t) ggml_nelements(dst));
+                CUDA_CHECK(cudaMemcpyAsync(h.data(), dst->data, h.size()*sizeof(float),
+                        cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                size_t zeros = 0, neg_inf = 0, other = 0;
+                for (float x : h) {
+                    if (x == 0.0f) zeros++;
+                    else if (isinf(x) && x < 0.0f) neg_inf++;
+                    else other++;
+                }
+                fprintf(stderr,
+                        "[S2BAUDIT-OWNGEN] dev=%d base=%lld rows=%lld zero=%zu -inf=%zu other=%zu first16=",
+                        dev, (long long) sh_base, (long long) sh_rows, zeros, neg_inf, other);
+                for (size_t i = 0; i < std::min<size_t>(16, h.size()); ++i) {
+                    fprintf(stderr, "%c", h[i] == 0.0f ? 'U' : isinf(h[i]) && h[i] < 0.0f ? '.' : '?');
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+    } else if (sh_mode == 3) {
+        // shared-top-k verify: batch-tail collision mask (see kernel comment).
+        // src0 = I32 tail input view [1, n_tail]; op_params are build-time
+        // constants (member-independent, safe under graph reuse).
+        GGML_ASSERT(ne00 == 1 && ne11 == 1 && ne12 == 1);
+        GGML_ASSERT(src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F16);
+        const int64_t n_tail = src0->ne[1];
+        const int threads = 256;
+        const dim3 blocks((unsigned) ((ne10 + threads - 1)/threads), 1, 1);
+        k_spec_tail_collision_mask<<<blocks, threads, 0, stream>>>(
+            (const int32_t *) src0->data, (const int32_t *) src1->data, (half *) dst->data,
+            ne10, n_tail, nb10/sizeof(int32_t), nb1/sizeof(half));
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
+            ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream, sh_base, sh_rows);
+    }
+
+    // One-launch S2b audit. For layer 0 on every device, verify the global
+    // selection/ownership split and sample the actual post-kernel rows. A
+    // foreign row must be exactly zero; an owned row must be populated.
+    static const bool s2b_audit = getenv("LLAMA_S2B_AUDIT") != nullptr;
+    if (s2b_audit && strcmp(dst->name, "s2b_local_k-0") == 0 &&
+            dst->type == GGML_TYPE_F32 && sh_mode != 0) {
+        static std::atomic<uint32_t> audited_devices{0};
+        int dev = -1;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        const uint32_t bit = dev >= 0 && dev < 32 ? 1u << dev : 0;
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (bit != 0 && cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
+                capture == cudaStreamCaptureStatusNone &&
+                (audited_devices.fetch_or(bit) & bit) == 0) {
+            const int64_t n_idx = ggml_nelements(src1);
+            std::vector<int32_t> idx((size_t) n_idx);
+            CUDA_CHECK(cudaMemcpyAsync(idx.data(), src1->data, idx.size()*sizeof(int32_t),
+                    cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int64_t n_owned = 0, n_foreign = 0;
+            int64_t first_owned = -1, first_foreign = -1;
+            int32_t mn = INT32_MAX, mx = INT32_MIN;
+            for (int64_t i = 0; i < n_idx; ++i) {
+                mn = std::min(mn, idx[(size_t) i]);
+                mx = std::max(mx, idx[(size_t) i]);
+                const bool owned = idx[(size_t) i] >= sh_base &&
+                    idx[(size_t) i] < sh_base + sh_rows;
+                if (owned) {
+                    n_owned++;
+                    if (first_owned < 0) first_owned = i;
+                } else {
+                    n_foreign++;
+                    if (first_foreign < 0) first_foreign = i;
+                }
+            }
+            auto row_stats = [&](int64_t row, float & max_abs, float & sum_abs, float first[4]) {
+                max_abs = 0.0f;
+                sum_abs = 0.0f;
+                std::vector<float> h((size_t) ne00);
+                if (row >= 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(h.data(),
+                            (const char *) dst->data + row*nb1,
+                            h.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    for (float x : h) {
+                        max_abs = std::max(max_abs, fabsf(x));
+                        sum_abs += fabsf(x);
+                    }
+                    for (int i = 0; i < 4; ++i) first[i] = i < ne00 ? h[(size_t) i] : 0.0f;
+                } else {
+                    for (int i = 0; i < 4; ++i) first[i] = 0.0f;
+                }
+            };
+            float own_max, own_sum, foreign_max, foreign_sum;
+            float own_first[4], foreign_first[4];
+            row_stats(first_owned, own_max, own_sum, own_first);
+            row_stats(first_foreign, foreign_max, foreign_sum, foreign_first);
+            fprintf(stderr,
+                    "[S2BAUDIT-ROWS] dev=%d base=%lld rows=%lld idx=%lld range=[%d,%d] owned=%lld foreign=%lld "
+                    "owned_pos=%lld gidx=%d max=%.6g sum=%.6g first=%.5g,%.5g,%.5g,%.5g "
+                    "foreign_pos=%lld gidx=%d max=%.6g sum=%.6g first=%.5g,%.5g,%.5g,%.5g\n",
+                    dev, (long long) sh_base, (long long) sh_rows, (long long) n_idx, mn, mx,
+                    (long long) n_owned, (long long) n_foreign,
+                    (long long) first_owned, first_owned >= 0 ? idx[(size_t) first_owned] : -1,
+                    own_max, own_sum, own_first[0], own_first[1], own_first[2], own_first[3],
+                    (long long) first_foreign, first_foreign >= 0 ? idx[(size_t) first_foreign] : -1,
+                    foreign_max, foreign_sum,
+                    foreign_first[0], foreign_first[1], foreign_first[2], foreign_first[3]);
+            fflush(stderr);
+        }
+    }
 
     // gather-vs-truth (post-kernel): dequantize cache row sp_cmp_row host-side
     // (q8_0) and compare against the gathered dst row 0 (F32)

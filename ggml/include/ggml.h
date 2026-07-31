@@ -1675,6 +1675,15 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // As above, with an explicit output type. Backends may support a subset of
+    // types; currently used by CUDA to dequantize gathered rows directly to
+    // F16 instead of materializing F32 followed by a cast.
+    GGML_API struct ggml_tensor * ggml_get_rows_as(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            enum ggml_type        type);
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
@@ -2607,9 +2616,10 @@ extern "C" {
     // Same srcs/params as ggml_flash_attn_ext, but the result is the
     // UNNORMALIZED per-member partial: dst F32 [DV+2, n_head, n_q, 2] where
     // row = [ numerator O | kq max M | softmax denom S ] and dim3 indexes the
-    // TP pair member slot. The producing member writes its own slot and zeroes
-    // the peer slot (member index injected via op_params[8] by the meta
-    // backend rebuild); an allreduce then completes both slots.
+    // TP group member slot (n_slots = group size, 2..16). The producing member
+    // writes its own slot and zeroes the other slots (member index injected
+    // via op_params[8] by the meta backend rebuild); an allreduce/allgather
+    // then completes all slots.
     GGML_API struct ggml_tensor * ggml_flash_attn_partial(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -2619,9 +2629,10 @@ extern "C" {
         struct ggml_tensor  * sinks,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap);
+        float                 logit_softcap,
+        int                   n_slots);
 
-    // Merge the two member slots of ggml_flash_attn_partial into the final
+    // Merge the member slots of ggml_flash_attn_partial into the final
     // normalized attention output [DV, n_head, n_q] (log-sum-exp combine;
     // identical result on every member).
     GGML_API struct ggml_tensor * ggml_flash_attn_combine(

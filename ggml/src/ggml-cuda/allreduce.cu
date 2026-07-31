@@ -426,16 +426,14 @@ static __global__ void ggml_cuda_ar_flat_kernel(
 // ---------------------------------------------------------------------------
 
 static constexpr int    GGML_CUDA_AR_GRAPH_SLOTS      = 2;
-// max wire bytes per AR in captured graphs. Default raised to 2 MiB for the
-// S2b partial-attention exchange ([DV+2]*n_head*T*2 slots F32: ~1.6 MiB at
-// T=4); host-mapped wire at these sizes is ~100-200us. GGML_CUDA_AR_GRAPH_SLOT_KB
-// overrides (the meta outer-capture admission check reads this same value via
-// ggml_cuda_ar_graph_slot_bytes()).
+// Max logical bytes per AR in captured graphs. 1280 KiB covers GLM-5.2 S2b
+// verification through T=4 (514*64*4*2*sizeof(float) = 1028 KiB).
+// GGML_CUDA_AR_GRAPH_SLOT_KB overrides this value.
 static size_t ggml_cuda_ar_graph_slot_bytes_impl() {
     static const size_t v = [](){
         const char * e = getenv("GGML_CUDA_AR_GRAPH_SLOT_KB");
-        const long kb = e ? atol(e) : 2048;
-        return (size_t) (kb > 0 ? kb : 2048) * 1024;
+        const long kb = e ? atol(e) : 1280;
+        return (size_t) (kb > 0 ? kb : 1280) * 1024;
     }();
     return v;
 }
@@ -772,8 +770,24 @@ static int * ggml_cuda_ar_graph_ack_ptr(const ggml_cuda_ar_pipeline * p, int slo
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->graph_ctrl.dev + base + offset);
 }
+static int * ggml_cuda_ar_graph_gather_ready_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
+    const size_t unit = (size_t)GGML_CUDA_AR_GRAPH_SLOTS * p->n_devices *
+                        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    const size_t base = (1 + p->n_devices) * unit;
+    const size_t offset = ((size_t)slot * p->n_devices + rank) *
+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(p->graph_ctrl.dev + base + offset);
+}
+static int * ggml_cuda_ar_graph_gather_done_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
+    const size_t unit = (size_t)GGML_CUDA_AR_GRAPH_SLOTS * p->n_devices *
+                        GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    const size_t base = (2 + p->n_devices) * unit;
+    const size_t offset = ((size_t)slot * p->n_devices + rank) *
+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+    return reinterpret_cast<int *>(p->graph_ctrl.dev + base + offset);
+}
 static size_t ggml_cuda_ar_graph_ctrl_bytes(size_t n_devices) {
-    return (1 + n_devices) * (size_t)GGML_CUDA_AR_GRAPH_SLOTS * n_devices *
+    return (3 + n_devices) * (size_t)GGML_CUDA_AR_GRAPH_SLOTS * n_devices *
            GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
 }
 
@@ -1843,6 +1857,213 @@ static bool ggml_cuda_ar_allreduce_flat_graph(
     return true;
 }
 
+struct ggml_cuda_ar_gather_graph_args {
+    const uint4 * src[GGML_CUDA_AR_FLAT_MAX_RANKS];
+    uint4       * dst[GGML_CUDA_AR_FLAT_MAX_RANKS];
+    int           count_vec[GGML_CUDA_AR_FLAT_MAX_RANKS];
+    int           offset_vec[GGML_CUDA_AR_FLAT_MAX_RANKS];
+    int         * ready[GGML_CUDA_AR_GRAPH_SLOTS][GGML_CUDA_AR_FLAT_MAX_RANKS];
+    int         * done[GGML_CUDA_AR_GRAPH_SLOTS][GGML_CUDA_AR_FLAT_MAX_RANKS];
+    int         * ack_out[GGML_CUDA_AR_GRAPH_SLOTS][GGML_CUDA_AR_FLAT_MAX_RANKS];
+    const int   * ack_in[GGML_CUDA_AR_GRAPH_SLOTS][GGML_CUDA_AR_FLAT_MAX_RANKS];
+};
+
+// Graph-replay-safe byte all-gather. Rank r writes its own contiguous shard
+// directly into the r-th disjoint range of every destination. Two device
+// barriers are required: ready protects destination lifetime and orders all
+// source producers before peer reads; done prevents downstream consumers from
+// observing a partially assembled destination. The acknowledgement ring keeps
+// a fast rank from reusing a control slot before every peer consumed it.
+static __global__ void ggml_cuda_ar_allgather_bytes_graph_kernel(
+        ggml_cuda_ar_gather_graph_args args,
+        int                            n_ranks,
+        int                            my_rank,
+        int                          * counter) {
+    constexpr int ARRIVAL_INTS = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid  = threadIdx.x;
+    const int bid  = blockIdx.x;
+    const int gtid = bid * blockDim.x + tid;
+    const int gnt  = gridDim.x * blockDim.x;
+
+    __shared__ int s_token;
+    if (tid == 0) {
+        const int token = counter[bid] + 1;
+        counter[bid] = token;
+        s_token = token;
+    }
+    __syncthreads();
+
+    const int token = s_token;
+    const int slot  = token & (GGML_CUDA_AR_GRAPH_SLOTS - 1);
+    const int prev  = token - GGML_CUDA_AR_GRAPH_SLOTS;
+
+    if (prev > 0 && tid == 0) {
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            const int * ack = args.ack_in[slot][r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(ack) < prev) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif
+            }
+        }
+    }
+    __syncthreads();
+
+    // The kernel is stream-ordered after this rank's cache update. Publish
+    // arrival only once all earlier device work is globally visible.
+    __threadfence_system();
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(args.ready[slot][my_rank] + bid * ARRIVAL_INTS, token);
+        __threadfence_system();
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            const int * ready = args.ready[slot][r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(ready) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif
+            }
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+
+    const uint4 * src = args.src[my_rank];
+    const int count = args.count_vec[my_rank];
+    const int offset = args.offset_vec[my_rank];
+    for (int i = gtid; i < count; i += gnt) {
+        const uint4 value = src[i];
+        for (int r = 0; r < n_ranks; ++r) {
+            args.dst[r][offset + i] = value;
+        }
+    }
+
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(args.done[slot][my_rank] + bid * ARRIVAL_INTS, token);
+        __threadfence_system();
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r == my_rank) {
+                continue;
+            }
+            const int * done = args.done[slot][r] + bid * ARRIVAL_INTS;
+            while (ggml_cuda_ar_signal_get(done) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif
+            }
+        }
+        for (int r = 0; r < n_ranks; ++r) {
+            if (r != my_rank) {
+                ggml_cuda_ar_signal_set(args.ack_out[slot][r] + bid * ARRIVAL_INTS, token);
+            }
+        }
+        __threadfence_system();
+    }
+}
+
+bool ggml_cuda_ar_allgather_bytes_graph(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor          ** src,
+        ggml_tensor          ** dst,
+        const size_t          * src_bytes,
+        const size_t          * dst_offsets) {
+    GGML_ASSERT(p != nullptr);
+    const int n = p->n_devices;
+    const bool debug = getenv("GGML_META_GRAPH_DEBUG") != nullptr;
+    if (n < 2 || n > GGML_CUDA_AR_FLAT_MAX_RANKS) {
+        if (debug) {
+            fprintf(stderr, "GRAPH_GATHER_REJECT: ranks=%d unsupported\n", n);
+        }
+        return false;
+    }
+
+    ggml_cuda_ar_gather_graph_args args = {};
+    for (int r = 0; r < n; ++r) {
+        const char * reason = nullptr;
+        if (src[r] == nullptr || dst[r] == nullptr) {
+            reason = "null tensor";
+        } else if ((src_bytes[r] & 0xF) != 0) {
+            reason = "shard bytes not 16-byte aligned";
+        } else if ((dst_offsets[r] & 0xF) != 0) {
+            reason = "destination offset not 16-byte aligned";
+        } else if (((uintptr_t)src[r]->data & 0xF) != 0) {
+            reason = "source pointer not 16-byte aligned";
+        } else if (((uintptr_t)dst[r]->data & 0xF) != 0) {
+            reason = "destination pointer not 16-byte aligned";
+        } else if (dst_offsets[r] + src_bytes[r] > ggml_nbytes(dst[r])) {
+            reason = "destination metadata too small";
+        } else if (src_bytes[r] / 16 > INT_MAX || dst_offsets[r] / 16 > INT_MAX) {
+            reason = "vector count overflow";
+        }
+        if (reason != nullptr) {
+            if (debug) {
+                fprintf(stderr,
+                        "GRAPH_GATHER_REJECT: rank=%d reason=%s src=%p dst=%p "
+                        "bytes=%zu offset=%zu dst_nbytes=%zu\n",
+                        r, reason, src[r] != nullptr ? src[r]->data : nullptr,
+                        dst[r] != nullptr ? dst[r]->data : nullptr,
+                        src_bytes[r], dst_offsets[r],
+                        dst[r] != nullptr ? ggml_nbytes(dst[r]) : 0);
+            }
+            return false;
+        }
+        args.src[r]        = reinterpret_cast<const uint4 *>(src[r]->data);
+        args.dst[r]        = reinterpret_cast<uint4 *>(dst[r]->data);
+        args.count_vec[r]  = (int)(src_bytes[r] / 16);
+        args.offset_vec[r] = (int)(dst_offsets[r] / 16);
+    }
+
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(cuda_ctx->stream(), &cs) != cudaSuccess ||
+                cs == cudaStreamCaptureStatusNone) {
+            if (debug) {
+                fprintf(stderr,
+                        "GRAPH_GATHER_REJECT: rank=%d stream capture status=%d\n",
+                        i, (int) cs);
+            }
+            (void)cudaGetLastError();
+            return false;
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        for (int slot = 0; slot < GGML_CUDA_AR_GRAPH_SLOTS; ++slot) {
+            for (int r = 0; r < n; ++r) {
+                args.ready[slot][r] = ggml_cuda_ar_graph_gather_ready_ptr(p, slot, r);
+                args.done[slot][r]  = ggml_cuda_ar_graph_gather_done_ptr(p, slot, r);
+                args.ack_out[slot][r] = ggml_cuda_ar_graph_ack_ptr(p, slot, r, i);
+                args.ack_in[slot][r]  = ggml_cuda_ar_graph_ack_ptr(p, slot, i, r);
+            }
+        }
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        ggml_cuda_ar_allgather_bytes_graph_kernel<<<
+                dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, cuda_ctx->stream()>>>(
+                    args, n, i, p->graph_counter[i]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
+
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -1900,6 +2121,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
+    return false;
+}
+bool ggml_cuda_ar_allgather_bytes_graph(
+        ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **, ggml_tensor **,
+        const size_t *, const size_t *) {
     return false;
 }
 

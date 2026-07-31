@@ -906,7 +906,10 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
+    // FLASH_ATTN_PARTIAL needs the same trailing F16-conversion scratch as
+    // FLASH_ATTN_EXT (S2b-at-prefill feeds the quantized cache directly);
+    // without the reservation the conversion writes past the allocation.
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_PARTIAL
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
@@ -1204,6 +1207,15 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ret->comms.resize(n);
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
+        // NCCL remains the ordinary all-reduce implementation, but outer
+        // CUDA-graph capture also needs the internal pipeline's device-side
+        // counters/control block for replay-safe byte all-gather.
+        ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
+        if (ret->ar_pipeline == nullptr) {
+            GGML_LOG_WARN("internal graph communication init failed; "
+                          "captured byte all-gather will be unavailable\n");
+            (void) cudaGetLastError();
+        }
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
         return;
     }
@@ -1272,6 +1284,38 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+static bool ggml_backend_cuda_comm_allgather_bytes(
+        void * comm_ctx_v,
+        struct ggml_tensor ** src,
+        struct ggml_tensor ** dst,
+        const size_t * src_bytes,
+        const size_t * dst_offsets) {
+    if (comm_ctx_v == nullptr) {
+        if (getenv("GGML_META_GRAPH_DEBUG") != nullptr) {
+            fprintf(stderr, "GRAPH_GATHER_REJECT: null communication context\n");
+        }
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->ar_pipeline == nullptr) {
+        if (getenv("GGML_META_GRAPH_DEBUG") != nullptr) {
+            fprintf(stderr, "GRAPH_GATHER_REJECT: graph communication pipeline unavailable\n");
+        }
+        return false;
+    }
+    return ggml_cuda_ar_allgather_bytes_graph(
+            comm_ctx->ar_pipeline, comm_ctx->backends.data(),
+            src, dst, src_bytes, dst_offsets);
+}
+
+static bool ggml_backend_cuda_comm_graph_allgather_available(void * comm_ctx_v) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    return comm_ctx->ar_pipeline != nullptr;
 }
 
 // host buffer type
@@ -2496,6 +2540,17 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
+    // row-strided same-layout 2D pair (e.g. the S2b head-sliced slot
+    // exchange): copy only the live rows via a 2D memcpy instead of the
+    // flat ggml_nbytes span (which would ship the gaps too)
+    const bool cpy_2d = src->type == dst->type &&
+        src->ne[1] > 1 && src->ne[2] == 1 && src->ne[3] == 1 &&
+        src->ne[0] == dst->ne[0] && src->ne[1] == dst->ne[1] &&
+        src->nb[0] == dst->nb[0] && src->nb[1] == dst->nb[1] &&
+        src->nb[0] == ggml_type_size(src->type) &&
+        src->nb[1] > (size_t) src->ne[0]*src->nb[0];
+    const size_t cpy_2d_w = (size_t) src->ne[0]*src->nb[0];
+
     if (backend_src != backend_dst) {
         // copy on src stream
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
@@ -2503,12 +2558,23 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+            if (cpy_2d) {
+                CUDA_CHECK(cudaMemcpy2DAsync(dst->data, dst->nb[1], src->data, src->nb[1],
+                        cpy_2d_w, src->ne[1], cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+            }
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            if (cpy_2d) {
+                // no 2D peer variant; UVA resolves the devices from the pointers
+                CUDA_CHECK(cudaMemcpy2DAsync(dst->data, dst->nb[1], src->data, src->nb[1],
+                        cpy_2d_w, src->ne[1], cudaMemcpyDefault, cuda_ctx_src->stream()));
+            } else {
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            }
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -2524,7 +2590,12 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        if (cpy_2d) {
+            CUDA_CHECK(cudaMemcpy2DAsync(dst->data, dst->nb[1], src->data, src->nb[1],
+                    cpy_2d_w, src->ne[1], cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+        }
     }
     return true;
 }
@@ -5463,6 +5534,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allgather_bytes") == 0) {
+        return (void *)ggml_backend_cuda_comm_allgather_bytes;
+    }
+    if (strcmp(name, "ggml_backend_comm_graph_allgather_available") == 0) {
+        return (void *)ggml_backend_cuda_comm_graph_allgather_available;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

@@ -3896,16 +3896,24 @@ struct ggml_tensor * ggml_get_rows(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
-    GGML_ASSERT(a->ne[2] == b->ne[1]);
-    GGML_ASSERT(a->ne[3] == b->ne[2]);
-    GGML_ASSERT(b->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_I32);
-
-    // TODO: implement non F32 return
     enum ggml_type type = GGML_TYPE_F32;
     if (a->type == GGML_TYPE_I32) {
         type = a->type;
     }
+    return ggml_get_rows_as(ctx, a, b, type);
+}
+
+struct ggml_tensor * ggml_get_rows_as(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_type        type) {
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(a->ne[3] == b->ne[2]);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ||
+                type == GGML_TYPE_BF16 || type == GGML_TYPE_I32);
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
 
     result->op     = GGML_OP_GET_ROWS;
@@ -6359,17 +6367,21 @@ struct ggml_tensor * ggml_flash_attn_partial(
         struct ggml_tensor  * sinks,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        int                   n_slots) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(n_slots >= 2 && n_slots <= 16);
     if (mask) {
         GGML_ASSERT(ggml_is_contiguous(mask));
     }
 
     // [ numerator DV | max M | denom S ] rows, dim order matching the
     // flash_attn_ext dst convention [DV, n_head, n_q] (head-fastest rows),
-    // with dim3 = the 2 member slots
-    int64_t ne[4] = { v->ne[0] + 2, q->ne[2], q->ne[1], 2 };
+    // with dim3 = the member slots (TP group size)
+    // ne2 folds the per-batch query count and the batch dim (q->ne[3] sequences
+    // of q->ne[1] queries) - matches the FA temp-buffer unrolled row order
+    int64_t ne[4] = { v->ne[0] + 2, q->ne[2], q->ne[1]*q->ne[3], n_slots };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
@@ -6394,7 +6406,7 @@ struct ggml_tensor * ggml_flash_attn_combine(
         struct ggml_context * ctx,
         struct ggml_tensor  * partial) {
     GGML_ASSERT(partial->type == GGML_TYPE_F32);
-    GGML_ASSERT(partial->ne[3] == 2);
+    GGML_ASSERT(partial->ne[3] >= 2 && partial->ne[3] <= 16);
     GGML_ASSERT(partial->ne[0] > 2);
 
     int64_t ne[4] = { partial->ne[0] - 2, partial->ne[1], partial->ne[2], 1 };

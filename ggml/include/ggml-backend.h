@@ -206,6 +206,13 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    typedef bool   (*ggml_backend_comm_allgather_bytes_t)(
+            void * comm_ctx,
+            struct ggml_tensor ** src,
+            struct ggml_tensor ** dst,
+            const size_t * src_bytes,
+            const size_t * dst_offsets);
+    typedef bool   (*ggml_backend_comm_graph_allgather_available_t)(void * comm_ctx);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
